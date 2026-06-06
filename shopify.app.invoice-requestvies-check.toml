@@ -1,0 +1,18 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
+client_id = "d35036f12cbfe6f51115bac7a50af31e"
+name = "invoice request/vies check"
+application_url = "https://example.com"
+embedded = true
+
+[webhooks]
+api_version = "2026-04"
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_customer_events,read_customers,write_customers,read_customer_merge,write_customer_merge,customer_read_companies,customer_write_companies,customer_write_customers,customer_read_customers,customer_read_draft_orders,customer_read_orders,customer_write_orders,unauthenticated_write_customers,unauthenticated_read_customers,unauthenticated_read_customer_tags"
+optional_scopes = [ ]
+use_legacy_install_flow = false
+
+[auth]
+redirect_urls = [ ]

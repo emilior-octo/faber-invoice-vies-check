@@ -1,0 +1,662 @@
+import { data as json, useFetcher, useLoaderData, useLocation } from "react-router";
+import { useEffect, useMemo, useState } from "react";
+import { authenticate } from "../shopify.server";
+import prisma from "../db.server";
+
+const STATUS_OPTIONS = [
+  { value: "all", label: "All" },
+  { value: "draft", label: "Draft" },
+  { value: "validated", label: "Validated" },
+  { value: "order_created", label: "Order created" },
+  { value: "processed", label: "Processed" },
+  { value: "rejected", label: "Rejected" },
+  { value: "failed", label: "Failed" },
+];
+
+function clean(value) {
+  return String(value || "").trim();
+}
+
+function formatDate(value) {
+  if (!value) return "—";
+
+  try {
+    return new Intl.DateTimeFormat("it-IT", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    }).format(new Date(value));
+  } catch (_error) {
+    return "—";
+  }
+}
+
+function normalizeRequest(item) {
+  return {
+    ...item,
+    createdAt: item.createdAt?.toISOString?.() || item.createdAt,
+    updatedAt: item.updatedAt?.toISOString?.() || item.updatedAt,
+  };
+}
+
+function getShopHandle(shop) {
+  return String(shop || "").replace(".myshopify.com", "");
+}
+
+function getOrderUrl(shop, orderId) {
+  if (!shop || !orderId) return "";
+
+  return `https://admin.shopify.com/store/${getShopHandle(shop)}/orders/${orderId}`;
+}
+
+export async function loader({ request }) {
+  const { session } = await authenticate.admin(request);
+  const url = new URL(request.url);
+
+  const status = clean(url.searchParams.get("status")) || "all";
+  const search = clean(url.searchParams.get("search"));
+
+  const where = {
+    shop: session.shop,
+    ...(status !== "all" ? { status } : {}),
+    ...(search
+      ? {
+          OR: [
+            { companyName: { contains: search } },
+            { vatNumber: { contains: search } },
+            { pec: { contains: search } },
+            { sdi: { contains: search } },
+            { orderName: { contains: search } },
+            { customerEmail: { contains: search } },
+          ],
+        }
+      : {}),
+  };
+
+  const [requests, counts] = await Promise.all([
+    prisma.invoiceRequest.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+      take: 100,
+    }),
+    prisma.invoiceRequest.groupBy({
+      by: ["status"],
+      where: { shop: session.shop },
+      _count: { status: true },
+    }),
+  ]);
+
+  return json({
+    shop: session.shop,
+    status,
+    search,
+    requests: requests.map(normalizeRequest),
+    counts: counts.reduce((acc, item) => {
+      acc[item.status] = item._count.status;
+      return acc;
+    }, {}),
+  });
+}
+
+export async function action({ request }) {
+  const { session } = await authenticate.admin(request);
+  const formData = await request.formData();
+
+  const intent = clean(formData.get("intent"));
+  const id = clean(formData.get("id"));
+
+  if (!id) {
+    return json({ ok: false, error: "Richiesta non valida." }, { status: 400 });
+  }
+
+  const statusByIntent = {
+    markProcessed: "processed",
+    markRejected: "rejected",
+    markValidated: "validated",
+  };
+
+  const nextStatus = statusByIntent[intent];
+
+  if (!nextStatus) {
+    return json({ ok: false, error: "Azione non riconosciuta." }, { status: 400 });
+  }
+
+  const updated = await prisma.invoiceRequest.updateMany({
+    where: {
+      id,
+      shop: session.shop,
+    },
+    data: {
+      status: nextStatus,
+    },
+  });
+
+  if (!updated.count) {
+    return json({ ok: false, error: "Richiesta non trovata." }, { status: 404 });
+  }
+
+  return json({ ok: true, id, status: nextStatus });
+}
+
+export default function InvoiceRequestsPage() {
+  const { shop, status, search, requests, counts } = useLoaderData();
+  const fetcher = useFetcher();
+  const location = useLocation();
+  const [selected, setSelected] = useState(null);
+
+  useEffect(() => {
+    if (fetcher.data?.ok && selected?.id === fetcher.data.id) {
+      setSelected((current) =>
+        current ? { ...current, status: fetcher.data.status } : current
+      );
+    }
+  }, [fetcher.data, selected?.id]);
+
+  const totalCount = useMemo(
+    () => Object.values(counts || {}).reduce((sum, value) => sum + Number(value || 0), 0),
+    [counts]
+  );
+
+  const embeddedQueryParams = useMemo(() => {
+    const params = new URLSearchParams(location.search);
+    params.delete("search");
+    params.delete("status");
+    return Array.from(params.entries());
+  }, [location.search]);
+
+  const resetHref = useMemo(() => {
+    const params = new URLSearchParams(location.search);
+    params.delete("search");
+    params.delete("status");
+    const query = params.toString();
+    return query ? `/app/invoice-requests?${query}` : "/app/invoice-requests";
+  }, [location.search]);
+
+  return (
+    <div style={styles.page}>
+      <div style={styles.headerRow}>
+        <div>
+          <h1 style={styles.title}>Invoice Requests</h1>
+          <p style={styles.subtitle}>
+            Controlla richieste fattura, VIES e reverse charge salvati dal cart drawer.
+          </p>
+        </div>
+        <div style={styles.counterBox}>
+          <strong>{totalCount}</strong>
+          <span>total requests</span>
+        </div>
+      </div>
+
+      <section style={styles.card}>
+        <div style={styles.toolbar}>
+          <form method="get" style={styles.filtersForm}>
+            {embeddedQueryParams.map(([key, value], index) => (
+              <input key={`${key}-${index}`} type="hidden" name={key} value={value} />
+            ))}
+            <input
+              type="search"
+              name="search"
+              defaultValue={search}
+              placeholder="Cerca azienda, VAT, PEC, ordine..."
+              style={styles.input}
+            />
+            <select name="status" defaultValue={status} style={styles.select}>
+              {STATUS_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                  {option.value !== "all" && counts?.[option.value]
+                    ? ` (${counts[option.value]})`
+                    : ""}
+                </option>
+              ))}
+            </select>
+            <button type="submit" style={styles.primaryButton}>Filtra</button>
+            <a href={resetHref} style={styles.secondaryLink}>Reset</a>
+          </form>
+        </div>
+
+        {fetcher.data?.error && (
+          <div style={styles.error}>{fetcher.data.error}</div>
+        )}
+
+        {requests.length === 0 ? (
+          <div style={styles.empty}>Nessuna richiesta trovata.</div>
+        ) : (
+          <div style={styles.tableWrapper}>
+            <table style={styles.table}>
+              <thead>
+                <tr>
+                  <th style={styles.th}>Data</th>
+                  <th style={styles.th}>Tipo</th>
+                  <th style={styles.th}>Azienda / Cliente</th>
+                  <th style={styles.th}>VAT</th>
+                  <th style={styles.th}>VIES</th>
+                  <th style={styles.th}>RC</th>
+                  <th style={styles.th}>Ordine</th>
+                  <th style={styles.th}>Status</th>
+                  <th style={styles.th}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {requests.map((request) => (
+                  <tr key={request.id} style={styles.tr}>
+                    <td style={styles.td}>{formatDate(request.createdAt)}</td>
+                    <td style={styles.td}>{request.invoiceType || "—"}</td>
+                    <td style={styles.td}>
+                      <strong>{request.companyName || request.customerEmail || "—"}</strong>
+                      {request.pec ? <span style={styles.mutedBlock}>{request.pec}</span> : null}
+                    </td>
+                    <td style={styles.td}>
+                      {request.countryCode || "—"} {request.vatNumber || ""}
+                    </td>
+                    <td style={styles.td}>
+                      <Badge tone={request.viesValid ? "success" : request.viesChecked ? "error" : "neutral"}>
+                        {request.viesValid ? "Valid" : request.viesChecked ? "Invalid" : "—"}
+                      </Badge>
+                    </td>
+                    <td style={styles.td}>
+                      <Badge tone={request.reverseCharge ? "success" : "neutral"}>
+                        {request.reverseCharge ? "Yes" : "No"}
+                      </Badge>
+                    </td>
+                    <td style={styles.td}>
+                      {request.orderId ? (
+                        <a href={getOrderUrl(shop, request.orderId)} target="_blank" rel="noreferrer" style={styles.link}>
+                          {request.orderName || `#${request.orderId}`}
+                        </a>
+                      ) : "—"}
+                    </td>
+                    <td style={styles.td}><StatusBadge status={request.status} /></td>
+                    <td style={styles.tdRight}>
+                      <button type="button" style={styles.smallButton} onClick={() => setSelected(request)}>
+                        View
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      {selected && (
+        <RequestDetail
+          shop={shop}
+          request={selected}
+          fetcher={fetcher}
+          onClose={() => setSelected(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function RequestDetail({ shop, request, fetcher, onClose }) {
+  const orderUrl = getOrderUrl(shop, request.orderId);
+  const isPrivate = request.invoiceType === "private";
+  const isCompany = request.invoiceType === "company";
+
+  return (
+    <div style={styles.drawerBackdrop} onClick={onClose}>
+      <aside style={styles.drawer} onClick={(event) => event.stopPropagation()}>
+        <div style={styles.drawerHeader}>
+          <div>
+            <h2 style={styles.drawerTitle}>Invoice request</h2>
+            <p style={styles.subtitle}>{request.id}</p>
+          </div>
+          <button type="button" style={styles.iconButton} onClick={onClose}>×</button>
+        </div>
+
+        <div style={styles.detailGrid}>
+          <h3 style={styles.sectionTitle}>Richiesta</h3>
+          <Detail label="Status" value={<StatusBadge status={request.status} />} />
+          <Detail label="Created" value={formatDate(request.createdAt)} />
+          <Detail label="Updated" value={formatDate(request.updatedAt)} />
+          <Detail label="Invoice type" value={isPrivate ? "Privato" : isCompany ? "Azienda" : request.invoiceType || "—"} />
+
+          <h3 style={styles.sectionTitle}>Ordine Shopify</h3>
+          <Detail label="Order" value={orderUrl ? <a href={orderUrl} target="_blank" rel="noreferrer" style={styles.link}>{request.orderName || request.orderId}</a> : "—"} />
+          <Detail label="Order ID" value={request.orderId || "—"} />
+          <Detail label="Customer email" value={request.customerEmail || "—"} />
+          <Detail label="Customer ID" value={request.customerId || "—"} />
+
+          <h3 style={styles.sectionTitle}>Dati fiscali</h3>
+          {isPrivate ? (
+            <>
+              <Detail label="Nome" value={[request.firstName, request.lastName].filter(Boolean).join(" ") || "—"} />
+              <Detail label="Codice fiscale" value={request.fiscalCode || "—"} />
+            </>
+          ) : (
+            <>
+              <Detail label="Company" value={request.companyName || "—"} />
+              <Detail label="Country" value={request.countryCode || "—"} />
+              <Detail label="VAT" value={request.vatNumber || "—"} />
+              <Detail label="PEC" value={request.pec || "—"} />
+              <Detail label="SDI" value={request.sdi || "—"} />
+              <Detail label="VIES checked" value={request.viesChecked ? "Yes" : "No"} />
+              <Detail label="VIES valid" value={request.viesValid === null || request.viesValid === undefined ? "—" : request.viesValid ? "Yes" : "No"} />
+              <Detail label="Reverse charge" value={request.reverseCharge ? "Yes" : "No"} />
+              <Detail label="Tax exempt applied" value={request.taxExemptApplied ? "Yes" : "No"} />
+            </>
+          )}
+
+          <h3 style={styles.sectionTitle}>Debug</h3>
+          <Detail label="Invoice request ID" value={request.id} />
+          <Detail label="Cart token" value={request.cartToken || "—"} />
+          <Detail label="Checkout token" value={request.checkoutToken || "—"} />
+          <Detail label="Error" value={request.errorMessage || "—"} />
+        </div>
+
+        <div style={styles.actionsRow}>
+          <StatusForm fetcher={fetcher} id={request.id} intent="markProcessed" label="Mark processed" />
+          <StatusForm fetcher={fetcher} id={request.id} intent="markRejected" label="Reject" variant="danger" />
+          <StatusForm fetcher={fetcher} id={request.id} intent="markValidated" label="Back to validated" variant="secondary" />
+        </div>
+      </aside>
+    </div>
+  );
+}
+
+function StatusForm({ fetcher, id, intent, label, variant = "primary" }) {
+  return (
+    <fetcher.Form method="post">
+      <input type="hidden" name="intent" value={intent} />
+      <input type="hidden" name="id" value={id} />
+      <button
+        type="submit"
+        style={{
+          ...styles.actionButton,
+          ...(variant === "danger" ? styles.dangerButton : {}),
+          ...(variant === "secondary" ? styles.secondaryButton : {}),
+        }}
+      >
+        {label}
+      </button>
+    </fetcher.Form>
+  );
+}
+
+function Detail({ label, value }) {
+  return (
+    <div style={styles.detailItem}>
+      <span style={styles.detailLabel}>{label}</span>
+      <span style={styles.detailValue}>{value}</span>
+    </div>
+  );
+}
+
+function StatusBadge({ status }) {
+  const tone =
+    status === "processed" ? "success" :
+    status === "rejected" || status === "failed" ? "error" :
+    status === "order_created" ? "info" :
+    "neutral";
+
+  return <Badge tone={tone}>{status || "—"}</Badge>;
+}
+
+function Badge({ tone = "neutral", children }) {
+  return <span style={{ ...styles.badge, ...styles[`badge_${tone}`] }}>{children}</span>;
+}
+
+const styles = {
+  page: {
+    padding: 24,
+    maxWidth: 1240,
+    margin: "0 auto",
+    color: "#202223",
+  },
+  headerRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 16,
+    alignItems: "flex-start",
+    marginBottom: 20,
+  },
+  title: {
+    margin: 0,
+    fontSize: 28,
+    lineHeight: 1.2,
+  },
+  subtitle: {
+    margin: "6px 0 0",
+    color: "#6d7175",
+    fontSize: 14,
+  },
+  counterBox: {
+    minWidth: 120,
+    padding: 14,
+    border: "1px solid #dfe3e8",
+    borderRadius: 12,
+    background: "#fff",
+    display: "grid",
+    gap: 4,
+    textAlign: "right",
+    fontSize: 13,
+    color: "#6d7175",
+  },
+  card: {
+    background: "#fff",
+    border: "1px solid #dfe3e8",
+    borderRadius: 12,
+    overflow: "hidden",
+  },
+  toolbar: {
+    padding: 16,
+    borderBottom: "1px solid #dfe3e8",
+  },
+  filtersForm: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 10,
+    alignItems: "center",
+  },
+  input: {
+    minWidth: 260,
+    flex: "1 1 280px",
+    padding: "10px 12px",
+    border: "1px solid #c9cccf",
+    borderRadius: 8,
+    fontSize: 14,
+  },
+  select: {
+    minWidth: 180,
+    padding: "10px 12px",
+    border: "1px solid #c9cccf",
+    borderRadius: 8,
+    background: "#fff",
+    fontSize: 14,
+  },
+  primaryButton: {
+    padding: "10px 14px",
+    border: "1px solid #202223",
+    borderRadius: 8,
+    background: "#202223",
+    color: "#fff",
+    cursor: "pointer",
+    fontWeight: 600,
+  },
+  secondaryLink: {
+    color: "#2c6ecb",
+    textDecoration: "none",
+    fontSize: 14,
+  },
+  error: {
+    margin: 16,
+    padding: 12,
+    borderRadius: 8,
+    background: "#fff4f4",
+    color: "#d72c0d",
+  },
+  empty: {
+    padding: 28,
+    color: "#6d7175",
+  },
+  tableWrapper: {
+    overflowX: "auto",
+  },
+  table: {
+    width: "100%",
+    borderCollapse: "collapse",
+    fontSize: 13,
+  },
+  th: {
+    textAlign: "left",
+    padding: "12px 14px",
+    color: "#6d7175",
+    background: "#f6f6f7",
+    borderBottom: "1px solid #dfe3e8",
+    whiteSpace: "nowrap",
+  },
+  tr: {
+    borderBottom: "1px solid #f1f2f3",
+  },
+  td: {
+    padding: "12px 14px",
+    verticalAlign: "top",
+    whiteSpace: "nowrap",
+  },
+  tdRight: {
+    padding: "12px 14px",
+    textAlign: "right",
+  },
+  mutedBlock: {
+    display: "block",
+    color: "#6d7175",
+    marginTop: 4,
+    fontSize: 12,
+  },
+  link: {
+    color: "#2c6ecb",
+    textDecoration: "none",
+  },
+  smallButton: {
+    padding: "7px 10px",
+    border: "1px solid #c9cccf",
+    borderRadius: 8,
+    background: "#fff",
+    cursor: "pointer",
+  },
+  badge: {
+    display: "inline-flex",
+    alignItems: "center",
+    minHeight: 22,
+    padding: "2px 8px",
+    borderRadius: 999,
+    fontSize: 12,
+    fontWeight: 600,
+    background: "#f1f2f3",
+    color: "#202223",
+  },
+  badge_success: { background: "#e3f1df", color: "#108043" },
+  badge_error: { background: "#fed3d1", color: "#d72c0d" },
+  badge_info: { background: "#e0f0ff", color: "#2c6ecb" },
+  badge_neutral: { background: "#f1f2f3", color: "#6d7175" },
+  drawerBackdrop: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(0,0,0,0.32)",
+    zIndex: 9999,
+    display: "flex",
+    justifyContent: "flex-end",
+  },
+  drawer: {
+    width: "min(560px, 100vw)",
+    height: "100vh",
+    minHeight: 0,
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
+    background: "#fff",
+    boxShadow: "-16px 0 32px rgba(0,0,0,0.18)",
+  },
+  drawerHeader: {
+    flex: "0 0 auto",
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 16,
+    padding: 24,
+    borderBottom: "1px solid #dfe3e8",
+  },
+  drawerTitle: {
+    margin: 0,
+    fontSize: 22,
+  },
+  iconButton: {
+    width: 36,
+    height: 36,
+    border: "1px solid #dfe3e8",
+    borderRadius: 8,
+    background: "#fff",
+    cursor: "pointer",
+    fontSize: 22,
+    lineHeight: 1,
+  },
+  detailGrid: {
+    flex: "1 1 auto",
+    minHeight: 0,
+    overflowY: "auto",
+    display: "grid",
+    gap: 10,
+    padding: 24,
+  },
+  sectionTitle: {
+    margin: "18px 0 2px",
+    paddingTop: 14,
+    borderTop: "1px solid #f1f2f3",
+    color: "#202223",
+    fontSize: 13,
+    fontWeight: 700,
+    textTransform: "uppercase",
+    letterSpacing: 0.3,
+  },
+  detailItem: {
+    display: "grid",
+    gap: 4,
+    padding: "10px 0",
+    borderBottom: "1px solid #f1f2f3",
+  },
+  detailLabel: {
+    color: "#6d7175",
+    fontSize: 12,
+    textTransform: "uppercase",
+    letterSpacing: 0.3,
+  },
+  detailValue: {
+    fontSize: 14,
+    wordBreak: "break-word",
+  },
+  actionsRow: {
+    flex: "0 0 auto",
+    position: "sticky",
+    bottom: 0,
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 10,
+    padding: 16,
+    borderTop: "1px solid #dfe3e8",
+    background: "#fff",
+    zIndex: 2,
+  },
+  actionButton: {
+    padding: "10px 14px",
+    border: "1px solid #202223",
+    borderRadius: 8,
+    background: "#202223",
+    color: "#fff",
+    cursor: "pointer",
+    fontWeight: 600,
+  },
+  dangerButton: {
+    borderColor: "#d72c0d",
+    background: "#d72c0d",
+  },
+  secondaryButton: {
+    borderColor: "#c9cccf",
+    background: "#fff",
+    color: "#202223",
+  },
+};

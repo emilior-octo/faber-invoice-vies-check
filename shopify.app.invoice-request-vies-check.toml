@@ -1,0 +1,28 @@
+client_id = "0b1e948821dbee54d55007ae22311cc2"
+
+name = "Invoice Request / VIES Check"
+handle = "octopus-invoice-vies-check"
+
+application_url = "https://customer-discount-panel-88h8.onrender.com"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = false
+
+[access_scopes]
+scopes = "read_customers,write_customers,read_orders,write_orders"
+
+[auth]
+redirect_urls = [
+  "https://customer-discount-panel-88h8.onrender.com/auth/callback",
+  "https://customer-discount-panel-88h8.onrender.com/auth/shopify/callback",
+  "https://customer-discount-panel-88h8.onrender.com/api/auth/callback"
+]
+
+[webhooks]
+api_version = "2026-07"
+
+[app_proxy]
+url = "https://customer-discount-panel-88h8.onrender.com/apps/invoice-request"
+subpath = "invoice-request"
+prefix = "apps"
