@@ -1,6 +1,6 @@
-client_id = "c69ae7252e8eadedfee50d8cc39e3b1a"
-name = "customer-discount-panel"
-application_url = "https://customer-discount-panel.onrender.com"
+client_id = "0b1e948821dbee54d55007ae22311cc2"
+name = "Invoice Request / VIES Check"
+application_url = "https://faber-invoice-vies-check.onrender.com"
 embedded = true
 
 [build]
@@ -26,11 +26,12 @@ scopes = "read_customers,write_customers,read_orders,write_orders"
 
 [auth]
 redirect_urls = [
-  "https://customer-discount-panel.onrender.com/auth/callback",
-  "https://customer-discount-panel.onrender.com/api/auth/callback",
-  "https://customer-discount-panel.onrender.com/api/auth"
+  "https://faber-invoice-vies-check.onrender.com/auth/callback",
+  "https://faber-invoice-vies-check.onrender.com/api/auth/callback",
+  "https://faber-invoice-vies-check.onrender.com/api/auth"
 ]
+
 [app_proxy]
-url = "https://customer-discount-panel.onrender.com/apps/invoice-request"
+url = "https://faber-invoice-vies-check.onrender.com/apps/invoice-request"
 subpath = "invoice-request"
 prefix = "apps"
