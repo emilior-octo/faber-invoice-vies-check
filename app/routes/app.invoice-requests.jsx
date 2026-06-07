@@ -1,4 +1,4 @@
-import { data as json, useFetcher, useLoaderData, useLocation } from "react-router";
+import { data as json, useFetcher, useLoaderData, useLocation, useNavigate } from "react-router";
 import { useEffect, useMemo, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
@@ -144,7 +144,40 @@ export default function InvoiceRequestsPage() {
   const { shop, status, search, requests, counts } = useLoaderData();
   const fetcher = useFetcher();
   const location = useLocation();
+  const navigate = useNavigate();
   const [selected, setSelected] = useState(null);
+
+  function handleFiltersSubmit(event) {
+    event.preventDefault();
+
+    const formData = new FormData(event.currentTarget);
+    const params = new URLSearchParams(location.search);
+
+    const nextSearch = clean(formData.get("search"));
+    const nextStatus = clean(formData.get("status")) || "all";
+
+    if (nextSearch) {
+      params.set("search", nextSearch);
+    } else {
+      params.delete("search");
+    }
+
+    params.set("status", nextStatus);
+
+    const query = params.toString();
+    navigate(query ? `/app/invoice-requests?${query}` : "/app/invoice-requests");
+  }
+
+  function handleResetFilters(event) {
+    event.preventDefault();
+
+    const params = new URLSearchParams(location.search);
+    params.delete("search");
+    params.delete("status");
+
+    const query = params.toString();
+    navigate(query ? `/app/invoice-requests?${query}` : "/app/invoice-requests");
+  }
 
   useEffect(() => {
     if (fetcher.data?.ok && selected?.id === fetcher.data.id) {
@@ -191,7 +224,7 @@ export default function InvoiceRequestsPage() {
 
       <section style={styles.card}>
         <div style={styles.toolbar}>
-          <form method="get" style={styles.filtersForm}>
+          <form method="get" style={styles.filtersForm} onSubmit={handleFiltersSubmit}>
             {embeddedQueryParams.map(([key, value], index) => (
               <input key={`${key}-${index}`} type="hidden" name={key} value={value} />
             ))}
@@ -213,7 +246,7 @@ export default function InvoiceRequestsPage() {
               ))}
             </select>
             <button type="submit" style={styles.primaryButton}>Filtra</button>
-            <a href={resetHref} style={styles.secondaryLink}>Reset</a>
+            <a href={resetHref} style={styles.secondaryLink} onClick={handleResetFilters}>Reset</a>
           </form>
         </div>
 
