@@ -1,4 +1,4 @@
-import { data as json, useFetcher, useLoaderData, useLocation, useNavigate } from "react-router";
+import { data as json, useFetcher, useLoaderData, useLocation, useNavigate, useRevalidator } from "react-router";
 import { useEffect, useMemo, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
@@ -15,6 +15,16 @@ const STATUS_OPTIONS = [
 
 function clean(value) {
   return String(value || "").trim();
+}
+
+function cleanNullable(value) {
+  const cleaned = clean(value);
+  return cleaned || null;
+}
+
+function formBoolean(value) {
+  const cleaned = clean(value).toLowerCase();
+  return cleaned === "true" || cleaned === "yes" || cleaned === "1" || cleaned === "on";
 }
 
 function formatDate(value) {
@@ -105,6 +115,40 @@ export async function action({ request }) {
   const formData = await request.formData();
 
   const intent = clean(formData.get("intent"));
+
+  if (intent === "createManual") {
+    const invoiceType = clean(formData.get("invoiceType")) || "private";
+    const status = clean(formData.get("status")) || "order_created";
+    const orderName = cleanNullable(formData.get("orderName"));
+    const orderId = cleanNullable(formData.get("orderId"));
+
+    const created = await prisma.invoiceRequest.create({
+      data: {
+        shop: session.shop,
+        invoiceType,
+        status,
+        orderName,
+        orderId,
+        customerEmail: cleanNullable(formData.get("customerEmail")),
+        firstName: cleanNullable(formData.get("firstName")),
+        lastName: cleanNullable(formData.get("lastName")),
+        fiscalCode: cleanNullable(formData.get("fiscalCode")),
+        companyName: cleanNullable(formData.get("companyName")),
+        countryCode: cleanNullable(formData.get("countryCode")),
+        vatNumber: cleanNullable(formData.get("vatNumber")),
+        pec: cleanNullable(formData.get("pec")),
+        sdi: cleanNullable(formData.get("sdi")),
+        viesChecked: formBoolean(formData.get("viesChecked")),
+        viesValid: clean(formData.get("viesValid")) === "" ? null : formBoolean(formData.get("viesValid")),
+        reverseCharge: formBoolean(formData.get("reverseCharge")),
+        taxExemptApplied: formBoolean(formData.get("taxExemptApplied")),
+        errorMessage: cleanNullable(formData.get("note")) || "Created manually from admin UI",
+      },
+    });
+
+    return json({ ok: true, intent, id: created.id, status: created.status });
+  }
+
   const id = clean(formData.get("id"));
 
   if (!id) {
@@ -137,7 +181,7 @@ export async function action({ request }) {
     return json({ ok: false, error: "Richiesta non trovata." }, { status: 404 });
   }
 
-  return json({ ok: true, id, status: nextStatus });
+  return json({ ok: true, intent, id, status: nextStatus });
 }
 
 export default function InvoiceRequestsPage() {
@@ -145,7 +189,9 @@ export default function InvoiceRequestsPage() {
   const fetcher = useFetcher();
   const location = useLocation();
   const navigate = useNavigate();
+  const revalidator = useRevalidator();
   const [selected, setSelected] = useState(null);
+  const [showManualForm, setShowManualForm] = useState(false);
 
   function handleFiltersSubmit(event) {
     event.preventDefault();
@@ -180,12 +226,20 @@ export default function InvoiceRequestsPage() {
   }
 
   useEffect(() => {
-    if (fetcher.data?.ok && selected?.id === fetcher.data.id) {
+    if (!fetcher.data?.ok) return;
+
+    if (fetcher.data.intent === "createManual") {
+      setShowManualForm(false);
+      revalidator.revalidate();
+      return;
+    }
+
+    if (selected?.id === fetcher.data.id) {
       setSelected((current) =>
         current ? { ...current, status: fetcher.data.status } : current
       );
     }
-  }, [fetcher.data, selected?.id]);
+  }, [fetcher.data, selected?.id, revalidator]);
 
   const totalCount = useMemo(
     () => Object.values(counts || {}).reduce((sum, value) => sum + Number(value || 0), 0),
@@ -205,6 +259,12 @@ export default function InvoiceRequestsPage() {
     params.delete("status");
     const query = params.toString();
     return query ? `/app/invoice-requests?${query}` : "/app/invoice-requests";
+  }, [location.search]);
+
+  const exportHref = useMemo(() => {
+    const params = new URLSearchParams(location.search);
+    const query = params.toString();
+    return query ? `/app/invoice-requests/export?${query}` : "/app/invoice-requests/export";
   }, [location.search]);
 
   return (
@@ -247,8 +307,22 @@ export default function InvoiceRequestsPage() {
             </select>
             <button type="submit" style={styles.primaryButton}>Filtra</button>
             <a href={resetHref} style={styles.secondaryLink} onClick={handleResetFilters}>Reset</a>
+            <a href={exportHref} style={styles.secondaryLink}>Esporta CSV</a>
+            <button
+              type="button"
+              style={styles.smallButton}
+              onClick={() => setShowManualForm((value) => !value)}
+            >
+              {showManualForm ? "Chiudi inserimento" : "Crea manuale"}
+            </button>
           </form>
         </div>
+
+        {showManualForm && <ManualRequestForm fetcher={fetcher} />}
+
+        {fetcher.data?.ok && fetcher.data.intent === "createManual" && (
+          <div style={styles.success}>Richiesta manuale creata correttamente.</div>
+        )}
 
         {fetcher.data?.error && (
           <div style={styles.error}>{fetcher.data.error}</div>
@@ -323,6 +397,131 @@ export default function InvoiceRequestsPage() {
           onClose={() => setSelected(null)}
         />
       )}
+    </div>
+  );
+}
+
+function ManualRequestForm({ fetcher }) {
+  return (
+    <div style={styles.manualBox}>
+      <div style={styles.manualHeader}>
+        <div>
+          <h2 style={styles.manualTitle}>Crea richiesta manuale</h2>
+          <p style={styles.subtitle}>
+            Inserisci una richiesta già nota o recuperata da un ordine storico. Non modifica Shopify: salva solo nel database dell’app.
+          </p>
+        </div>
+      </div>
+
+      <fetcher.Form method="post" style={styles.manualForm}>
+        <input type="hidden" name="intent" value="createManual" />
+
+        <label style={styles.fieldLabel}>
+          Tipo fattura
+          <select name="invoiceType" defaultValue="private" style={styles.inputFull}>
+            <option value="private">Privato</option>
+            <option value="company">Azienda</option>
+          </select>
+        </label>
+
+        <label style={styles.fieldLabel}>
+          Status
+          <select name="status" defaultValue="order_created" style={styles.inputFull}>
+            <option value="draft">Draft</option>
+            <option value="validated">Validated</option>
+            <option value="order_created">Order created</option>
+            <option value="processed">Processed</option>
+            <option value="rejected">Rejected</option>
+            <option value="failed">Failed</option>
+          </select>
+        </label>
+
+        <label style={styles.fieldLabel}>
+          Ordine Shopify
+          <input name="orderName" placeholder="#24751" style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>
+          Order ID Shopify
+          <input name="orderId" placeholder="gid o ID numerico, opzionale" style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>
+          Email cliente
+          <input name="customerEmail" type="email" placeholder="cliente@example.com" style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>
+          Nome
+          <input name="firstName" style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>
+          Cognome
+          <input name="lastName" style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>
+          Codice fiscale
+          <input name="fiscalCode" style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>
+          Azienda
+          <input name="companyName" style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>
+          Paese
+          <input name="countryCode" placeholder="IT" maxLength={2} style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>
+          Partita IVA / VAT
+          <input name="vatNumber" style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>
+          PEC
+          <input name="pec" style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>
+          SDI
+          <input name="sdi" style={styles.inputFull} />
+        </label>
+
+        <label style={styles.checkboxLabel}>
+          <input type="checkbox" name="viesChecked" value="true" />
+          VIES checked
+        </label>
+
+        <label style={styles.checkboxLabel}>
+          <input type="checkbox" name="viesValid" value="true" />
+          VIES valid
+        </label>
+
+        <label style={styles.checkboxLabel}>
+          <input type="checkbox" name="reverseCharge" value="true" />
+          Reverse charge
+        </label>
+
+        <label style={styles.checkboxLabel}>
+          <input type="checkbox" name="taxExemptApplied" value="true" />
+          Tax exempt applied
+        </label>
+
+        <label style={{ ...styles.fieldLabel, gridColumn: "1 / -1" }}>
+          Nota interna
+          <textarea name="note" rows={3} style={styles.textarea} placeholder="Es. Richiesta inserita manualmente da ordine storico" />
+        </label>
+
+        <div style={styles.manualActions}>
+          <button type="submit" style={styles.primaryButton}>
+            Salva richiesta manuale
+          </button>
+        </div>
+      </fetcher.Form>
     </div>
   );
 }
@@ -523,6 +722,78 @@ const styles = {
     borderRadius: 8,
     background: "#fff4f4",
     color: "#d72c0d",
+  },
+  success: {
+    margin: 16,
+    padding: 12,
+    borderRadius: 8,
+    background: "#e3f1df",
+    color: "#108043",
+  },
+  manualBox: {
+    margin: 16,
+    padding: 16,
+    border: "1px solid #dfe3e8",
+    borderRadius: 12,
+    background: "#fafbfb",
+  },
+  manualHeader: {
+    marginBottom: 14,
+  },
+  manualTitle: {
+    margin: 0,
+    fontSize: 18,
+  },
+  manualForm: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+    gap: 12,
+  },
+  fieldLabel: {
+    display: "grid",
+    gap: 6,
+    color: "#6d7175",
+    fontSize: 12,
+    fontWeight: 700,
+    textTransform: "uppercase",
+    letterSpacing: 0.3,
+  },
+  inputFull: {
+    width: "100%",
+    padding: "10px 12px",
+    border: "1px solid #c9cccf",
+    borderRadius: 8,
+    background: "#fff",
+    color: "#202223",
+    fontSize: 14,
+    textTransform: "none",
+    letterSpacing: 0,
+    fontWeight: 400,
+  },
+  textarea: {
+    width: "100%",
+    padding: "10px 12px",
+    border: "1px solid #c9cccf",
+    borderRadius: 8,
+    background: "#fff",
+    color: "#202223",
+    fontSize: 14,
+    resize: "vertical",
+    textTransform: "none",
+    letterSpacing: 0,
+    fontWeight: 400,
+  },
+  checkboxLabel: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    color: "#202223",
+    fontSize: 14,
+  },
+  manualActions: {
+    gridColumn: "1 / -1",
+    display: "flex",
+    justifyContent: "flex-end",
   },
   empty: {
     padding: 28,
