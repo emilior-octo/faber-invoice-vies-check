@@ -39,9 +39,10 @@ function row(label, value) {
   return `<tr><th>${esc(label)}</th><td>${esc(value || "—")}</td></tr>`;
 }
 
-export async function loader({ request, params }) {
+export async function loader({ request }) {
   const { session } = await authenticate.admin(request);
-  const id = clean(params.id);
+  const url = new URL(request.url);
+  const id = clean(url.searchParams.get("id"));
 
   const item = await prisma.invoiceRequest.findFirst({
     where: {
@@ -49,6 +50,10 @@ export async function loader({ request, params }) {
       shop: session.shop,
     },
   });
+
+  if (!id) {
+    return new Response("ID richiesta mancante", { status: 400 });
+  }
 
   if (!item) {
     return new Response("Richiesta non trovata", { status: 404 });

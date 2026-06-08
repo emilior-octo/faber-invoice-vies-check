@@ -536,7 +536,11 @@ function ManualRequestForm({ fetcher }) {
 
 function RequestDetail({ shop, request, fetcher, embeddedSearch = "", onClose }) {
   const orderUrl = getOrderUrl(shop, request.orderId);
-  const printHref = `/app/invoice-requests/${request.id}/print${embeddedSearch || ""}`;
+  const printHref = (() => {
+    const params = new URLSearchParams(embeddedSearch ? embeddedSearch.slice(1) : "");
+    params.set("id", request.id);
+    return `/app/invoice-requests/print?${params.toString()}`;
+  })();
   const isPrivate = request.invoiceType === "private";
   const isCompany = request.invoiceType === "company";
 
@@ -976,3 +980,4 @@ const styles = {
     color: "#202223",
   },
 };
+
