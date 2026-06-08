@@ -267,6 +267,12 @@ export default function InvoiceRequestsPage() {
     return query ? `/app/invoice-requests/export?${query}` : "/app/invoice-requests/export";
   }, [location.search]);
 
+  const printAllHref = useMemo(() => {
+    const params = new URLSearchParams(location.search);
+    const query = params.toString();
+    return query ? `/app/invoice-requests/print-all?${query}` : "/app/invoice-requests/print-all";
+  }, [location.search]);
+
   return (
     <div style={styles.page}>
       <div style={styles.headerRow}>
@@ -308,6 +314,7 @@ export default function InvoiceRequestsPage() {
             <button type="submit" style={styles.primaryButton}>Filtra</button>
             <a href={resetHref} style={styles.secondaryLink} onClick={handleResetFilters}>Reset</a>
             <a href={exportHref} style={styles.secondaryLink}>Esporta CSV</a>
+            <a href={printAllHref} target="_blank" rel="noreferrer" style={styles.secondaryLink}>Stampa facsimili</a>
             <button
               type="button"
               style={styles.smallButton}
@@ -394,6 +401,7 @@ export default function InvoiceRequestsPage() {
           shop={shop}
           request={selected}
           fetcher={fetcher}
+          embeddedSearch={location.search}
           onClose={() => setSelected(null)}
         />
       )}
@@ -526,8 +534,9 @@ function ManualRequestForm({ fetcher }) {
   );
 }
 
-function RequestDetail({ shop, request, fetcher, onClose }) {
+function RequestDetail({ shop, request, fetcher, embeddedSearch = "", onClose }) {
   const orderUrl = getOrderUrl(shop, request.orderId);
+  const printHref = `/app/invoice-requests/${request.id}/print${embeddedSearch || ""}`;
   const isPrivate = request.invoiceType === "private";
   const isCompany = request.invoiceType === "company";
 
@@ -575,14 +584,17 @@ function RequestDetail({ shop, request, fetcher, onClose }) {
             </>
           )}
 
-          <h3 style={styles.sectionTitle}>Note e debug</h3>
+          <h3 style={styles.sectionTitle}>Note, prodotti e debug</h3>
           <Detail label="Invoice request ID" value={request.id} />
           <Detail label="Cart token" value={request.cartToken || "—"} />
           <Detail label="Checkout token" value={request.checkoutToken || "—"} />
-          <Detail label="Note amministrative" value={request.errorMessage || "—"} />
+          <Detail label="Note amministrative / Prodotti" value={request.errorMessage || "—"} />
         </div>
 
         <div style={styles.actionsRow}>
+          <a href={printHref} target="_blank" rel="noreferrer" style={{ ...styles.actionButton, ...styles.secondaryButton, textDecoration: "none" }}>
+            Stampa facsimile
+          </a>
           <StatusForm fetcher={fetcher} id={request.id} intent="markProcessed" label="Mark processed" />
           <StatusForm fetcher={fetcher} id={request.id} intent="markRejected" label="Reject" variant="danger" />
           <StatusForm fetcher={fetcher} id={request.id} intent="markValidated" label="Back to validated" variant="secondary" />
