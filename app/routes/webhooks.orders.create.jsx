@@ -107,6 +107,173 @@ function formatBillingAddress(address) {
   return lines.length ? `Billing address:\n${lines.join("\n")}` : "";
 }
 
+function formatMoneyValue(amount, currencyCode) {
+  const cleanAmount = clean(amount);
+  const cleanCurrency = clean(currencyCode);
+
+  if (!cleanAmount) return "";
+
+  const numeric = Number(cleanAmount);
+  const value = Number.isFinite(numeric) ? numeric.toFixed(2) : cleanAmount;
+
+  return cleanCurrency ? `${value} ${cleanCurrency}` : value;
+}
+
+function getShopMoney(moneySet) {
+  return moneySet?.shopMoney || moneySet?.presentmentMoney || null;
+}
+
+function formatOrderItemLine(item) {
+  if (!item) return "";
+
+  const sku = clean(item.sku || item.variant?.sku);
+  const title = clean(item.title || item.product?.title || item.name);
+  const variantTitle = clean(item.variantTitle || item.variant?.title || item.variant_title);
+  const quantity = clean(item.quantity);
+
+  const unitMoney = getShopMoney(item.originalUnitPriceSet || item.discountedUnitPriceSet || item.priceSet);
+  const totalMoney = getShopMoney(item.discountedTotalSet || item.originalTotalSet || item.totalDiscountSet);
+
+  const unitPrice = formatMoneyValue(unitMoney?.amount || item.price, unitMoney?.currencyCode || item.currency);
+  const totalPrice = formatMoneyValue(totalMoney?.amount || item.line_price || item.price, totalMoney?.currencyCode || item.currency);
+
+  const taxInfo = Array.isArray(item.taxLines || item.tax_lines) && (item.taxLines || item.tax_lines).length
+    ? ` | Tax: ${(item.taxLines || item.tax_lines)
+        .map((taxLine) => {
+          const rate = taxLine.ratePercentage !== undefined && taxLine.ratePercentage !== null
+            ? `${taxLine.ratePercentage}%`
+            : taxLine.rate !== undefined && taxLine.rate !== null
+              ? `${Number(taxLine.rate) * 100}%`
+              : "";
+          const priceMoney = getShopMoney(taxLine.priceSet);
+          const price = formatMoneyValue(priceMoney?.amount || taxLine.price, priceMoney?.currencyCode || item.currency);
+          return [clean(taxLine.title), rate, price].filter(Boolean).join(" ");
+        })
+        .filter(Boolean)
+        .join(", ")}`
+    : "";
+
+  const pieces = [
+    sku ? `${sku}` : "SKU —",
+    title || "Prodotto senza titolo",
+    variantTitle && variantTitle !== "Default Title" ? variantTitle : "",
+    quantity ? `Qty: ${quantity}` : "",
+    unitPrice ? `Unit: ${unitPrice}` : "",
+    totalPrice ? `Total: ${totalPrice}` : "",
+  ].filter(Boolean);
+
+  return `- ${pieces.join(" | ")}${taxInfo}`;
+}
+
+function formatOrderItems(items) {
+  const lines = (items || []).map(formatOrderItemLine).filter(Boolean);
+
+  return lines.length ? `Order items:
+${lines.join("
+")}` : "";
+}
+
+function formatPayloadOrderItems(payload) {
+  const items = Array.isArray(payload?.line_items)
+    ? payload.line_items
+    : Array.isArray(payload?.lineItems)
+      ? payload.lineItems
+      : [];
+
+  return formatOrderItems(items);
+}
+
+function getMoneyAmount(value) {
+  if (!value) return "";
+
+  if (typeof value === "string" || typeof value === "number") {
+    return clean(value);
+  }
+
+  return clean(
+    value?.shop_money?.amount ||
+      value?.shopMoney?.amount ||
+      value?.presentment_money?.amount ||
+      value?.presentmentMoney?.amount ||
+      value?.amount
+  );
+}
+
+function getMoneyCurrency(value, fallbackCurrency) {
+  if (!value || typeof value === "string" || typeof value === "number") {
+    return clean(fallbackCurrency);
+  }
+
+  return clean(
+    value?.shop_money?.currency_code ||
+      value?.shop_money?.currencyCode ||
+      value?.shopMoney?.currencyCode ||
+      value?.presentment_money?.currency_code ||
+      value?.presentmentMoney?.currencyCode ||
+      value?.currency_code ||
+      value?.currencyCode ||
+      fallbackCurrency
+  );
+}
+
+function firstMoney(payload, candidates) {
+  for (const candidate of candidates) {
+    const value = candidate();
+    const amount = getMoneyAmount(value);
+    if (amount) {
+      return {
+        amount,
+        currency: getMoneyCurrency(value, payload?.currency || payload?.currencyCode || payload?.presentment_currency || payload?.presentmentCurrency),
+      };
+    }
+  }
+
+  return { amount: "", currency: clean(payload?.currency || payload?.currencyCode || payload?.presentment_currency || payload?.presentmentCurrency) };
+}
+
+function formatOrderTotals(payload) {
+  const subtotal = firstMoney(payload, [
+    () => payload?.current_subtotal_price_set,
+    () => payload?.subtotal_price_set,
+    () => payload?.current_subtotal_price,
+    () => payload?.subtotal_price,
+  ]);
+
+  const shipping = firstMoney(payload, [
+    () => payload?.total_shipping_price_set,
+    () => payload?.shipping_price_set,
+    () => payload?.total_shipping_price,
+    () => payload?.shipping_price,
+  ]);
+
+  const tax = firstMoney(payload, [
+    () => payload?.current_total_tax_set,
+    () => payload?.total_tax_set,
+    () => payload?.current_total_tax,
+    () => payload?.total_tax,
+  ]);
+
+  const total = firstMoney(payload, [
+    () => payload?.current_total_price_set,
+    () => payload?.total_price_set,
+    () => payload?.current_total_price,
+    () => payload?.total_price,
+  ]);
+
+  const currency = clean(total.currency || subtotal.currency || shipping.currency || tax.currency || payload?.currency || payload?.currencyCode);
+
+  const lines = [
+    subtotal.amount ? `Subtotal: ${formatMoneyValue(subtotal.amount, subtotal.currency || currency)}` : "",
+    shipping.amount ? `Shipping: ${formatMoneyValue(shipping.amount, shipping.currency || currency)}` : "",
+    tax.amount ? `Tax: ${formatMoneyValue(tax.amount, tax.currency || currency)}` : "",
+    total.amount ? `Total: ${formatMoneyValue(total.amount, total.currency || currency)}` : "",
+    currency ? `Currency: ${currency}` : "",
+  ].filter(Boolean);
+
+  return lines.length ? `Order totals:
+${lines.join("\n")}` : "";
+}
+
 function appendSystemNote(currentNote, nextNote) {
   const current = clean(currentNote);
   const next = clean(nextNote);
@@ -265,6 +432,38 @@ async function fetchNativeOrderFiscalData(admin, orderGid) {
           countryCodeV2
           phone
         }
+        lineItems(first: 100) {
+          nodes {
+            title
+            sku
+            quantity
+            variantTitle
+            taxable
+            originalUnitPriceSet {
+              shopMoney {
+                amount
+                currencyCode
+              }
+            }
+            discountedTotalSet {
+              shopMoney {
+                amount
+                currencyCode
+              }
+            }
+            taxLines {
+              title
+              rate
+              ratePercentage
+              priceSet {
+                shopMoney {
+                  amount
+                  currencyCode
+                }
+              }
+            }
+          }
+        }
         customer {
           id
           legacyResourceId
@@ -361,6 +560,7 @@ async function fetchNativeOrderFiscalData(admin, orderGid) {
     companyName: clean(billingAddress.company || shippingAddress.company),
     countryCode: clean(billingAddress.countryCodeV2 || shippingAddress.countryCodeV2),
     billingAddressNote: formatBillingAddress(billingAddress),
+    orderItemsNote: formatOrderItems(order.lineItems?.nodes || []),
   };
 }
 
@@ -486,7 +686,13 @@ export async function action({ request }) {
   const finalOrderNumericId = orderNumericId || enrichedFiscalData?.orderNumericId || "";
   const finalOrderName = orderName || enrichedFiscalData?.orderName || "";
   const finalCountryCode = invoiceCountryCode || enrichedFiscalData?.countryCode || "";
-  const administrativeNotes = enrichedFiscalData?.billingAddressNote || "";
+  const orderTotalsNote = formatOrderTotals(payload);
+  const orderItemsNote = enrichedFiscalData?.orderItemsNote || formatPayloadOrderItems(payload);
+  const administrativeNotes = [
+    enrichedFiscalData?.billingAddressNote || "",
+    orderTotalsNote,
+    orderItemsNote,
+  ].filter(Boolean).join("\n\n");
 
   let invoiceSyncCount = 0;
 
