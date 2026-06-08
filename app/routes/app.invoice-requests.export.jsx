@@ -94,7 +94,7 @@ export async function loader({ request }) {
     ["viesValid", "VIES valido"],
     ["reverseCharge", "Reverse charge"],
     ["taxExemptApplied", "Tax exempt applicato"],
-    ["errorMessage", "Note / errore"],
+    ["errorMessage", "Note / Billing address"],
     ["id", "Invoice request ID"],
     ["cartToken", "Cart token"],
     ["checkoutToken", "Checkout token"],

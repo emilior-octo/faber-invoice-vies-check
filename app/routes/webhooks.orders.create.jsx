@@ -87,6 +87,36 @@ function getPayloadLastName(payload) {
   );
 }
 
+function formatAddressLine(parts) {
+  return parts.map(clean).filter(Boolean).join(" ");
+}
+
+function formatBillingAddress(address) {
+  if (!address) return "";
+
+  const lines = [
+    formatAddressLine([address.firstName, address.lastName]),
+    clean(address.company),
+    clean(address.address1),
+    clean(address.address2),
+    formatAddressLine([address.zip, address.city, address.provinceCode]),
+    clean(address.countryCodeV2),
+    clean(address.phone) ? `Phone: ${clean(address.phone)}` : "",
+  ].filter(Boolean);
+
+  return lines.length ? `Billing address:\n${lines.join("\n")}` : "";
+}
+
+function appendSystemNote(currentNote, nextNote) {
+  const current = clean(currentNote);
+  const next = clean(nextNote);
+
+  if (!current) return next || null;
+  if (!next) return current;
+
+  return `${current}\n\n${next}`;
+}
+
 function normalizeKey(value) {
   return clean(value).toLowerCase().replace(/[^a-z0-9]/g, "");
 }
@@ -166,6 +196,7 @@ async function syncInvoiceRequestWithOrder({
   viesChecked,
   viesValid,
   reverseCharge,
+  administrativeNotes,
 }) {
   const where = buildWhere({ shop, invoiceRequestId, cartToken });
 
@@ -193,7 +224,7 @@ async function syncInvoiceRequestWithOrder({
       viesValid: optionalBoolean(viesValid),
       reverseCharge: optionalBoolean(reverseCharge),
       status: "order_created",
-      errorMessage: null,
+      errorMessage: administrativeNotes || null,
     },
   });
 }
@@ -329,6 +360,7 @@ async function fetchNativeOrderFiscalData(admin, orderGid) {
     vatNumber,
     companyName: clean(billingAddress.company || shippingAddress.company),
     countryCode: clean(billingAddress.countryCodeV2 || shippingAddress.countryCodeV2),
+    billingAddressNote: formatBillingAddress(billingAddress),
   };
 }
 
@@ -454,6 +486,7 @@ export async function action({ request }) {
   const finalOrderNumericId = orderNumericId || enrichedFiscalData?.orderNumericId || "";
   const finalOrderName = orderName || enrichedFiscalData?.orderName || "";
   const finalCountryCode = invoiceCountryCode || enrichedFiscalData?.countryCode || "";
+  const administrativeNotes = enrichedFiscalData?.billingAddressNote || "";
 
   let invoiceSyncCount = 0;
 
@@ -478,6 +511,7 @@ export async function action({ request }) {
       viesChecked,
       viesValid,
       reverseCharge,
+      administrativeNotes,
     });
 
     invoiceSyncCount = syncResult?.count || 0;
@@ -517,7 +551,10 @@ export async function action({ request }) {
       await prisma.invoiceRequest.updateMany({
         where,
         data: {
-          errorMessage: `Order linked, but order metafields/tags failed: ${error?.message || "Unknown error"}`,
+          errorMessage: appendSystemNote(
+            administrativeNotes,
+            `System notes:\nOrder linked, but order metafields/tags failed: ${error?.message || "Unknown error"}`
+          ),
         },
       });
     }

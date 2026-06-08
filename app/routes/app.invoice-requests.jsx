@@ -142,7 +142,7 @@ export async function action({ request }) {
         viesValid: clean(formData.get("viesValid")) === "" ? null : formBoolean(formData.get("viesValid")),
         reverseCharge: formBoolean(formData.get("reverseCharge")),
         taxExemptApplied: formBoolean(formData.get("taxExemptApplied")),
-        errorMessage: cleanNullable(formData.get("note")) || "Created manually from admin UI",
+        errorMessage: cleanNullable(formData.get("note")) || "Creata manualmente da Admin UI",
       },
     });
 
@@ -575,11 +575,11 @@ function RequestDetail({ shop, request, fetcher, onClose }) {
             </>
           )}
 
-          <h3 style={styles.sectionTitle}>Debug</h3>
+          <h3 style={styles.sectionTitle}>Note e debug</h3>
           <Detail label="Invoice request ID" value={request.id} />
           <Detail label="Cart token" value={request.cartToken || "—"} />
           <Detail label="Checkout token" value={request.checkoutToken || "—"} />
-          <Detail label="Error" value={request.errorMessage || "—"} />
+          <Detail label="Note amministrative" value={request.errorMessage || "—"} />
         </div>
 
         <div style={styles.actionsRow}>
