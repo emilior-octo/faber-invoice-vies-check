@@ -168,11 +168,8 @@ function formatOrderItemLine(item) {
 function formatOrderItems(items) {
   const lines = (items || []).map(formatOrderItemLine).filter(Boolean);
 
-  return lines.length ? `Order items:
-${lines.join("
-")}` : "";
+  return lines.length ? `Order items:\n${lines.join("\n")}` : "";
 }
-
 function formatPayloadOrderItems(payload) {
   const items = Array.isArray(payload?.line_items)
     ? payload.line_items
