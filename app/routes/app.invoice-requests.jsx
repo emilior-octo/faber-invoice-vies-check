@@ -4,7 +4,9 @@ import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 
 const STATUS_OPTIONS = [
-  { value: "all", label: "All" },
+  { value: "orders", label: "Solo ordini" },
+  { value: "cart", label: "Carrello / abbandonate" },
+  { value: "all", label: "Tutte" },
   { value: "draft", label: "Draft" },
   { value: "validated", label: "Validated" },
   { value: "order_created", label: "Order created" },
@@ -61,31 +63,75 @@ function getOrderUrl(shop, orderId) {
   return `https://admin.shopify.com/store/${getShopHandle(shop)}/orders/${orderId}`;
 }
 
+function buildInvoiceRequestWhere({ shop, status = "orders", search = "" }) {
+  const and = [{ shop }];
+
+  if (status === "orders") {
+    and.push({
+      OR: [
+        { orderId: { not: null } },
+        { orderName: { not: null } },
+      ],
+    });
+  } else if (status === "cart") {
+    and.push({
+      AND: [
+        { orderId: null },
+        { orderName: null },
+      ],
+    });
+  } else if (status !== "all") {
+    and.push({ status });
+  }
+
+  if (search) {
+    and.push({
+      OR: [
+        { companyName: { contains: search } },
+        { vatNumber: { contains: search } },
+        { pec: { contains: search } },
+        { sdi: { contains: search } },
+        { orderName: { contains: search } },
+        { customerEmail: { contains: search } },
+        { fiscalCode: { contains: search } },
+        { firstName: { contains: search } },
+        { lastName: { contains: search } },
+      ],
+    });
+  }
+
+  return and.length === 1 ? and[0] : { AND: and };
+}
+
+function buildOrderOnlyWhere(shop) {
+  return {
+    shop,
+    OR: [
+      { orderId: { not: null } },
+      { orderName: { not: null } },
+    ],
+  };
+}
+
+function buildCartOnlyWhere(shop) {
+  return {
+    shop,
+    AND: [
+      { orderId: null },
+      { orderName: null },
+    ],
+  };
+}
+
 export async function loader({ request }) {
   const { session } = await authenticate.admin(request);
   const url = new URL(request.url);
 
-  const status = clean(url.searchParams.get("status")) || "all";
+  const status = clean(url.searchParams.get("status")) || "orders";
   const search = clean(url.searchParams.get("search"));
+  const where = buildInvoiceRequestWhere({ shop: session.shop, status, search });
 
-  const where = {
-    shop: session.shop,
-    ...(status !== "all" ? { status } : {}),
-    ...(search
-      ? {
-          OR: [
-            { companyName: { contains: search } },
-            { vatNumber: { contains: search } },
-            { pec: { contains: search } },
-            { sdi: { contains: search } },
-            { orderName: { contains: search } },
-            { customerEmail: { contains: search } },
-          ],
-        }
-      : {}),
-  };
-
-  const [requests, counts] = await Promise.all([
+  const [requests, counts, orderCount, cartCount] = await Promise.all([
     prisma.invoiceRequest.findMany({
       where,
       orderBy: { createdAt: "desc" },
@@ -96,6 +142,8 @@ export async function loader({ request }) {
       where: { shop: session.shop },
       _count: { status: true },
     }),
+    prisma.invoiceRequest.count({ where: buildOrderOnlyWhere(session.shop) }),
+    prisma.invoiceRequest.count({ where: buildCartOnlyWhere(session.shop) }),
   ]);
 
   return json({
@@ -103,10 +151,15 @@ export async function loader({ request }) {
     status,
     search,
     requests: requests.map(normalizeRequest),
-    counts: counts.reduce((acc, item) => {
-      acc[item.status] = item._count.status;
-      return acc;
-    }, {}),
+    stats: { orderCount, cartCount },
+    counts: {
+      orders: orderCount,
+      cart: cartCount,
+      ...counts.reduce((acc, item) => {
+        acc[item.status] = item._count.status;
+        return acc;
+      }, {}),
+    },
   });
 }
 
@@ -185,7 +238,7 @@ export async function action({ request }) {
 }
 
 export default function InvoiceRequestsPage() {
-  const { shop, status, search, requests, counts } = useLoaderData();
+  const { shop, status, search, requests, counts, stats } = useLoaderData();
   const fetcher = useFetcher();
   const location = useLocation();
   const navigate = useNavigate();
@@ -200,7 +253,7 @@ export default function InvoiceRequestsPage() {
     const params = new URLSearchParams(location.search);
 
     const nextSearch = clean(formData.get("search"));
-    const nextStatus = clean(formData.get("status")) || "all";
+    const nextStatus = clean(formData.get("status")) || "orders";
 
     if (nextSearch) {
       params.set("search", nextSearch);
@@ -241,10 +294,8 @@ export default function InvoiceRequestsPage() {
     }
   }, [fetcher.data, selected?.id, revalidator]);
 
-  const totalCount = useMemo(
-    () => Object.values(counts || {}).reduce((sum, value) => sum + Number(value || 0), 0),
-    [counts]
-  );
+  const totalCount = Number(stats?.orderCount || 0);
+  const cartCount = Number(stats?.cartCount || 0);
 
   const embeddedQueryParams = useMemo(() => {
     const params = new URLSearchParams(location.search);
@@ -279,12 +330,13 @@ export default function InvoiceRequestsPage() {
         <div>
           <h1 style={styles.title}>Invoice Requests</h1>
           <p style={styles.subtitle}>
-            Controlla richieste fattura, VIES e reverse charge salvati dal cart drawer.
+            Di default vedi solo richieste collegate a ordini reali. Quelle da carrello/checkout abbandonato restano filtrabili ma non finiscono nel flusso amministrativo.
           </p>
         </div>
         <div style={styles.counterBox}>
           <strong>{totalCount}</strong>
-          <span>total requests</span>
+          <span>ordini con richiesta</span>
+          <small style={styles.counterSubtext}>{cartCount} carrello/abbandonate</small>
         </div>
       </div>
 
@@ -686,6 +738,10 @@ const styles = {
     fontSize: 13,
     color: "#6d7175",
   },
+  counterSubtext: {
+    fontSize: 11,
+    color: "#8c9196",
+  },
   card: {
     background: "#fff",
     border: "1px solid #dfe3e8",
@@ -980,4 +1036,3 @@ const styles = {
     color: "#202223",
   },
 };
-
