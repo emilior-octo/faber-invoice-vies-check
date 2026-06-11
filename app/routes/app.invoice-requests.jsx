@@ -522,6 +522,51 @@ export async function action({ request }) {
     return json({ ok: true, intent, id: updated.id, status: updated.status });
   }
 
+  if (intent === "backfillMissingOrders") {
+    const limit = Math.min(Math.max(Number(formData.get("limit") || 50), 1), 100);
+    const candidates = await prisma.invoiceRequest.findMany({
+      where: {
+        AND: [
+          buildOrderOnlyWhere(session.shop),
+          buildMissingWhere(),
+        ],
+      },
+      orderBy: { createdAt: "asc" },
+      take: limit,
+    });
+
+    const results = [];
+
+    for (const current of candidates) {
+      try {
+        const order = await fetchOrderForBackfill(admin, {
+          orderId: clean(current.orderId),
+          orderName: clean(current.orderName),
+        });
+        const backfillData = buildBackfillDataFromOrder(order, current);
+        await prisma.invoiceRequest.update({
+          where: { id: current.id },
+          data: backfillData,
+        });
+        results.push({ id: current.id, ok: true, orderName: backfillData.orderName || current.orderName || current.orderId });
+      } catch (error) {
+        results.push({ id: current.id, ok: false, orderName: current.orderName || current.orderId || current.id, error: error?.message || "Errore backfill" });
+      }
+    }
+
+    const okCount = results.filter((item) => item.ok).length;
+    const failed = results.filter((item) => !item.ok);
+
+    return json({
+      ok: failed.length === 0,
+      intent,
+      processed: results.length,
+      updated: okCount,
+      failed: failed.length,
+      error: failed.length ? `${failed.length} backfill falliti su ${results.length}. Primo errore: ${failed[0]?.orderName}: ${failed[0]?.error}` : "",
+    });
+  }
+
   const id = clean(formData.get("id"));
 
   if (!id) {
@@ -601,7 +646,7 @@ export default function InvoiceRequestsPage() {
   useEffect(() => {
     if (!fetcher.data?.ok) return;
 
-    if (["createManual", "updateFiscal", "backfillOrder"].includes(fetcher.data.intent)) {
+    if (["createManual", "updateFiscal", "backfillOrder", "backfillMissingOrders"].includes(fetcher.data.intent)) {
       setShowManualForm(false);
       revalidator.revalidate();
       return;
@@ -686,7 +731,7 @@ export default function InvoiceRequestsPage() {
             <button type="submit" style={styles.primaryButton}>Filtra</button>
             <a href={resetHref} style={styles.secondaryLink} onClick={handleResetFilters}>Reset</a>
             <a href={exportHref} style={styles.secondaryLink}>Esporta CSV</a>
-            <a href={printAllHref} target="_blank" rel="noreferrer" style={styles.secondaryLink}>Stampa facsimili</a>
+            <a href={printAllHref} style={styles.secondaryLink}>Stampa facsimili</a>
             <button
               type="button"
               style={styles.smallButton}
@@ -695,12 +740,27 @@ export default function InvoiceRequestsPage() {
               {showManualForm ? "Chiudi inserimento" : "Crea manuale"}
             </button>
           </form>
+
+          <fetcher.Form method="post" style={styles.bulkBackfillForm}>
+            <input type="hidden" name="intent" value="backfillMissingOrders" />
+            <input type="hidden" name="limit" value="50" />
+            <button type="submit" style={{ ...styles.smallButton, ...styles.warningButton }}>
+              Backfill missing visibili/vecchi
+            </button>
+            <span style={styles.mutedText}>Aggiorna fino a 50 ordini mancanti da Shopify.</span>
+          </fetcher.Form>
         </div>
 
         {showManualForm && <ManualRequestForm fetcher={fetcher} />}
 
         {fetcher.data?.ok && fetcher.data.intent === "createManual" && (
           <div style={styles.success}>Richiesta manuale creata correttamente.</div>
+        )}
+
+        {fetcher.data?.ok && fetcher.data.intent === "backfillMissingOrders" && (
+          <div style={styles.success}>
+            Backfill completato: {fetcher.data.updated || 0} aggiornate su {fetcher.data.processed || 0} richieste.
+          </div>
         )}
 
         {fetcher.data?.error && (
@@ -982,7 +1042,7 @@ function RequestDetail({ shop, request, fetcher, embeddedSearch = "", onClose })
 
         <div style={styles.actionsRow}>
           <BackfillForm request={request} fetcher={fetcher} />
-          <a href={printHref} target="_blank" rel="noreferrer" style={{ ...styles.actionButton, ...styles.secondaryButton, textDecoration: "none" }}>
+          <a href={printHref} style={{ ...styles.actionButton, ...styles.secondaryButton, textDecoration: "none" }}>
             Stampa facsimile
           </a>
           <StatusForm fetcher={fetcher} id={request.id} intent="markProcessed" label="Mark processed" />
@@ -1205,6 +1265,13 @@ const styles = {
     gap: 10,
     alignItems: "center",
   },
+  bulkBackfillForm: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 10,
+    marginTop: 10,
+  },
   input: {
     minWidth: 260,
     flex: "1 1 280px",
@@ -1229,6 +1296,11 @@ const styles = {
     color: "#fff",
     cursor: "pointer",
     fontWeight: 600,
+  },
+  warningButton: {
+    borderColor: "#b98900",
+    background: "#fff7d6",
+    color: "#5c3b00",
   },
   secondaryLink: {
     color: "#2c6ecb",
