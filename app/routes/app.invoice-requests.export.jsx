@@ -41,6 +41,74 @@ function yesNo(value) {
   return value ? "Sì" : "No";
 }
 
+function cleanFlag(value) {
+  return String(value || "").trim();
+}
+
+function hasNoteSection(note, sectionTitle) {
+  return String(note || "").includes(sectionTitle);
+}
+
+function getMissingFlags(item) {
+  const flags = [];
+  const hasOrder = Boolean(item?.orderId || item?.orderName);
+  const invoiceType = cleanFlag(item?.invoiceType);
+  const countryCode = cleanFlag(item?.countryCode).toUpperCase();
+  const notes = item?.errorMessage || "";
+
+  if (!hasOrder) flags.push("ordine non collegato");
+  if (hasOrder && !hasNoteSection(notes, "Order totals:")) flags.push("totali mancanti");
+  if (hasOrder && !hasNoteSection(notes, "Order items:")) flags.push("prodotti mancanti");
+
+  if (invoiceType === "company") {
+    if (!cleanFlag(item?.companyName)) flags.push("azienda mancante");
+    if (!countryCode) flags.push("paese mancante");
+    if (!cleanFlag(item?.vatNumber)) flags.push("VAT mancante");
+    if (countryCode === "IT") {
+      if (!cleanFlag(item?.pec)) flags.push("PEC mancante");
+      if (!cleanFlag(item?.sdi)) flags.push("SDI mancante");
+    }
+    if (countryCode && countryCode !== "IT" && item?.viesChecked && item?.viesValid !== true) {
+      flags.push("VIES non valido");
+    }
+  }
+
+  if (invoiceType === "private" && countryCode === "IT" && !cleanFlag(item?.fiscalCode)) {
+    flags.push("CF mancante");
+  }
+
+  if (item?.status === "failed") flags.push("failed");
+
+  return flags;
+}
+
+function buildMissingWhere() {
+  return {
+    OR: [
+      { errorMessage: null },
+      { NOT: { errorMessage: { contains: "Order totals:" } } },
+      { NOT: { errorMessage: { contains: "Order items:" } } },
+      { invoiceType: "company", OR: [{ vatNumber: null }, { vatNumber: "" }] },
+      { invoiceType: "company", OR: [{ countryCode: null }, { countryCode: "" }] },
+      {
+        AND: [
+          { invoiceType: "company" },
+          { countryCode: "IT" },
+          { OR: [{ pec: null }, { pec: "" }] },
+          { OR: [{ sdi: null }, { sdi: "" }] },
+        ],
+      },
+      {
+        AND: [
+          { invoiceType: "private" },
+          { countryCode: "IT" },
+          { OR: [{ fiscalCode: null }, { fiscalCode: "" }] },
+        ],
+      },
+    ],
+  };
+}
+
 function extractNoteLineValue(note, label) {
   const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const regex = new RegExp(`(?:^|\\n)${escapedLabel}:\\s*([^\\n]+)`, "i");
@@ -108,6 +176,9 @@ function buildInvoiceRequestWhere({ shop, status = "orders", search = "" }) {
         { orderName: { not: null } },
       ],
     });
+  } else if (status === "missing") {
+    and.push({ OR: [{ orderId: { not: null } }, { orderName: { not: null } }] });
+    and.push(buildMissingWhere());
   } else if (status === "cart") {
     and.push({
       AND: [
@@ -156,6 +227,7 @@ export async function loader({ request }) {
     ["createdAt", "Data richiesta"],
     ["updatedAt", "Ultimo aggiornamento"],
     ["status", "Status"],
+    ["missingFlags", "Dati mancanti"],
     ["invoiceType", "Tipo fattura"],
     ["orderName", "Ordine Shopify"],
     ["orderId", "Order ID"],
@@ -192,6 +264,7 @@ export async function loader({ request }) {
       return columns
         .map(([key]) => {
           if (key === "createdAt" || key === "updatedAt") return csvCell(formatDate(item[key]));
+          if (key === "missingFlags") return csvCell(getMissingFlags(item).join(" | ") || "OK");
           if (["viesChecked", "viesValid", "reverseCharge", "taxExemptApplied"].includes(key)) {
             return csvCell(yesNo(item[key]));
           }

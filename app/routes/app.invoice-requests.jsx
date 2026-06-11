@@ -5,6 +5,7 @@ import prisma from "../db.server";
 
 const STATUS_OPTIONS = [
   { value: "orders", label: "Solo ordini" },
+  { value: "missing", label: "Ordini con dati mancanti" },
   { value: "cart", label: "Carrello / abbandonate" },
   { value: "all", label: "Tutte" },
   { value: "draft", label: "Draft" },
@@ -22,6 +23,17 @@ function clean(value) {
 function cleanNullable(value) {
   const cleaned = clean(value);
   return cleaned || null;
+}
+
+function upperNullable(value) {
+  const cleaned = clean(value).toUpperCase();
+  return cleaned || null;
+}
+
+function optionalBooleanFromForm(value) {
+  const cleaned = clean(value);
+  if (cleaned === "") return null;
+  return formBoolean(cleaned);
 }
 
 function formBoolean(value) {
@@ -73,6 +85,9 @@ function buildInvoiceRequestWhere({ shop, status = "orders", search = "" }) {
         { orderName: { not: null } },
       ],
     });
+  } else if (status === "missing") {
+    and.push(buildOrderOnlyWhere(shop));
+    and.push(buildMissingWhere());
   } else if (status === "cart") {
     and.push({
       AND: [
@@ -123,8 +138,261 @@ function buildCartOnlyWhere(shop) {
   };
 }
 
+function buildMissingWhere() {
+  return {
+    OR: [
+      { errorMessage: null },
+      { NOT: { errorMessage: { contains: "Order totals:" } } },
+      { NOT: { errorMessage: { contains: "Order items:" } } },
+      { invoiceType: "company", OR: [{ vatNumber: null }, { vatNumber: "" }] },
+      { invoiceType: "company", OR: [{ countryCode: null }, { countryCode: "" }] },
+      {
+        AND: [
+          { invoiceType: "company" },
+          { countryCode: "IT" },
+          { OR: [{ pec: null }, { pec: "" }] },
+          { OR: [{ sdi: null }, { sdi: "" }] },
+        ],
+      },
+      {
+        AND: [
+          { invoiceType: "private" },
+          { countryCode: "IT" },
+          { OR: [{ fiscalCode: null }, { fiscalCode: "" }] },
+        ],
+      },
+    ],
+  };
+}
+
+function hasNoteSection(note, sectionTitle) {
+  return String(note || "").includes(sectionTitle);
+}
+
+function getMissingFlags(item) {
+  const flags = [];
+  const hasOrder = Boolean(item?.orderId || item?.orderName);
+  const invoiceType = clean(item?.invoiceType);
+  const countryCode = clean(item?.countryCode).toUpperCase();
+  const notes = item?.errorMessage || "";
+
+  if (!hasOrder) flags.push("ordine non collegato");
+  if (hasOrder && !hasNoteSection(notes, "Order totals:")) flags.push("totali mancanti");
+  if (hasOrder && !hasNoteSection(notes, "Order items:")) flags.push("prodotti mancanti");
+
+  if (invoiceType === "company") {
+    if (!clean(item?.companyName)) flags.push("azienda mancante");
+    if (!countryCode) flags.push("paese mancante");
+    if (!clean(item?.vatNumber)) flags.push("VAT mancante");
+    if (countryCode === "IT") {
+      if (!clean(item?.pec)) flags.push("PEC mancante");
+      if (!clean(item?.sdi)) flags.push("SDI mancante");
+    }
+    if (countryCode && countryCode !== "IT" && item?.viesChecked && item?.viesValid !== true) {
+      flags.push("VIES non valido");
+    }
+  }
+
+  if (invoiceType === "private" && countryCode === "IT" && !clean(item?.fiscalCode)) {
+    flags.push("CF mancante");
+  }
+
+  if (item?.status === "failed") flags.push("failed");
+
+  return flags;
+}
+
+function missingTone(flags) {
+  if (!flags?.length) return "success";
+  if (flags.some((flag) => ["VAT mancante", "paese mancante", "totali mancanti", "prodotti mancanti", "failed"].includes(flag))) {
+    return "error";
+  }
+  return "info";
+}
+
+function extractVatCandidate(...values) {
+  const combined = values.map(clean).filter(Boolean).join(" ").toUpperCase();
+  const match = combined.match(/\b(?:IT|AT|BE|BG|CY|CZ|DE|DK|EE|EL|ES|FI|FR|HR|HU|IE|LT|LU|LV|MT|NL|PL|PT|RO|SE|SI|SK)[A-Z0-9]{8,13}\b/);
+  return match ? match[0] : "";
+}
+
+function moneyLine(label, money) {
+  const amount = clean(money?.amount);
+  const currency = clean(money?.currencyCode);
+  if (!amount) return "";
+  return `${label}: ${amount}${currency ? ` ${currency}` : ""}`;
+}
+
+function formatBackfillBillingAddress(address = {}) {
+  const lines = [
+    clean(address.company),
+    [clean(address.firstName), clean(address.lastName)].filter(Boolean).join(" "),
+    clean(address.address1),
+    clean(address.address2),
+    [clean(address.zip), clean(address.city), clean(address.provinceCode)].filter(Boolean).join(" "),
+    clean(address.country || address.countryCodeV2),
+    address.phone ? `Phone: ${clean(address.phone)}` : "",
+  ].filter(Boolean);
+
+  return lines.length ? `Billing address:\n${lines.join("\n")}` : "";
+}
+
+function formatBackfillOrderItems(items = []) {
+  const lines = items.map((item) => {
+    const sku = clean(item?.sku) || "NO-SKU";
+    const title = [clean(item?.title), clean(item?.variantTitle)].filter(Boolean).join(" / ");
+    const qty = item?.quantity || 0;
+    const unit = item?.originalUnitPriceSet?.shopMoney;
+    const total = item?.discountedTotalSet?.shopMoney;
+    const taxes = (item?.taxLines || [])
+      .map((tax) => {
+        const title = clean(tax?.title) || "Tax";
+        const rate = tax?.ratePercentage !== undefined && tax?.ratePercentage !== null ? `${tax.ratePercentage}%` : "";
+        const amount = tax?.priceSet?.shopMoney?.amount ? `${tax.priceSet.shopMoney.amount} ${tax.priceSet.shopMoney.currencyCode || ""}`.trim() : "";
+        return [title, rate, amount].filter(Boolean).join(" ");
+      })
+      .filter(Boolean)
+      .join("; ");
+
+    return `- ${sku} | ${title || "Item"} | Qty: ${qty} | Unit: ${unit?.amount || ""} ${unit?.currencyCode || ""} | Total: ${total?.amount || ""} ${total?.currencyCode || ""}${taxes ? ` | Tax: ${taxes}` : ""}`.trim();
+  }).filter(Boolean);
+
+  return lines.length ? `Order items:\n${lines.join("\n")}` : "";
+}
+
+function formatBackfillOrderTotals(order = {}) {
+  const lines = [
+    moneyLine("Subtotal", order.subtotalPriceSet?.shopMoney),
+    moneyLine("Shipping", order.totalShippingPriceSet?.shopMoney),
+    moneyLine("Tax", order.totalTaxSet?.shopMoney),
+    moneyLine("Total", order.totalPriceSet?.shopMoney),
+    order.currencyCode ? `Currency: ${order.currencyCode}` : "",
+  ].filter(Boolean);
+
+  return lines.length ? `Order totals:\n${lines.join("\n")}` : "";
+}
+
+function pairValue(pairs, keys) {
+  const wanted = keys.map((key) => clean(key).toLowerCase());
+
+  for (const pair of pairs || []) {
+    const key = clean(pair?.key || pair?.name).toLowerCase();
+    const value = clean(pair?.value);
+    if (!key || !value) continue;
+    if (wanted.some((item) => key === item || key.includes(item))) return value;
+  }
+
+  return "";
+}
+
+function getOrderGid(value) {
+  const raw = clean(value);
+  if (!raw) return "";
+  return raw.startsWith("gid://") ? raw : `gid://shopify/Order/${raw}`;
+}
+
+async function fetchOrderForBackfill(admin, { orderId, orderName }) {
+  const orderFields = `
+    id
+    legacyResourceId
+    name
+    email
+    note
+    currencyCode
+    customAttributes { key value }
+    subtotalPriceSet { shopMoney { amount currencyCode } }
+    totalShippingPriceSet { shopMoney { amount currencyCode } }
+    totalTaxSet { shopMoney { amount currencyCode } }
+    totalPriceSet { shopMoney { amount currencyCode } }
+    billingAddress {
+      firstName lastName company address1 address2 city zip provinceCode country countryCodeV2 phone
+    }
+    shippingAddress {
+      firstName lastName company address1 address2 city zip provinceCode country countryCodeV2 phone
+    }
+    lineItems(first: 100) {
+      nodes {
+        title sku quantity variantTitle taxable
+        originalUnitPriceSet { shopMoney { amount currencyCode } }
+        discountedTotalSet { shopMoney { amount currencyCode } }
+        taxLines { title rate ratePercentage priceSet { shopMoney { amount currencyCode } } }
+      }
+    }
+    customer {
+      id legacyResourceId email firstName lastName
+      metafields(first: 50) { nodes { namespace key value } }
+    }
+  `;
+
+  if (orderId) {
+    const response = await admin.graphql(`#graphql
+      query BackfillOrderById($id: ID!) { order(id: $id) { ${orderFields} } }
+    `, { variables: { id: getOrderGid(orderId) } });
+    const payload = await response.json();
+    if (payload?.errors?.length) throw new Error(payload.errors.map((error) => error.message).join(" | "));
+    if (payload?.data?.order) return payload.data.order;
+  }
+
+  if (orderName) {
+    const query = `name:${orderName.replace(/^#/, "\\#")}`;
+    const response = await admin.graphql(`#graphql
+      query BackfillOrderByName($query: String!) { orders(first: 1, query: $query) { nodes { ${orderFields} } } }
+    `, { variables: { query } });
+    const payload = await response.json();
+    if (payload?.errors?.length) throw new Error(payload.errors.map((error) => error.message).join(" | "));
+    if (payload?.data?.orders?.nodes?.[0]) return payload.data.orders.nodes[0];
+  }
+
+  throw new Error("Ordine Shopify non trovato per backfill.");
+}
+
+function buildBackfillDataFromOrder(order = {}, current = {}) {
+  const billing = order.billingAddress || {};
+  const shipping = order.shippingAddress || {};
+  const customer = order.customer || {};
+  const attributes = order.customAttributes || [];
+  const metafields = (customer.metafields?.nodes || []).map((item) => ({
+    key: `${item.namespace}.${item.key}`,
+    value: item.value,
+  }));
+  const pairs = [...attributes, ...metafields];
+
+  const fiscalCode = pairValue(pairs, ["fiscal_code", "codice_fiscale", "codice fiscale", "cf", "tax_code"]);
+  const vatFromPairs = pairValue(pairs, ["vat_number", "partita_iva", "partita iva", "piva", "vat_id", "tax_id"]);
+  const vatNumber = vatFromPairs || extractVatCandidate(billing.company, billing.firstName, billing.lastName, shipping.company);
+  const pec = pairValue(pairs, ["pec", "certified_email", "posta certificata"]);
+  const sdi = pairValue(pairs, ["sdi", "codice_sdi", "recipient_code", "codice_destinatario"]);
+  const invoiceType = pairValue(pairs, ["invoice_type"]) || (vatNumber || billing.company ? "company" : "private");
+  const countryCode = pairValue(pairs, ["invoice_country_code", "country_code"]) || billing.countryCodeV2 || shipping.countryCodeV2 || current.countryCode;
+
+  const notes = [
+    formatBackfillBillingAddress(billing),
+    formatBackfillOrderTotals(order),
+    formatBackfillOrderItems(order.lineItems?.nodes || []),
+    order.note ? `Order note:\n${order.note}` : "",
+  ].filter(Boolean).join("\n\n");
+
+  return {
+    orderId: order.legacyResourceId ? String(order.legacyResourceId) : clean(current.orderId),
+    orderName: clean(order.name || current.orderName),
+    customerEmail: clean(order.email || customer.email || current.customerEmail).toLowerCase(),
+    customerId: customer.legacyResourceId ? String(customer.legacyResourceId) : clean(customer.id || current.customerId),
+    invoiceType,
+    countryCode: clean(countryCode).toUpperCase(),
+    firstName: clean(billing.firstName || shipping.firstName || customer.firstName || current.firstName),
+    lastName: clean(billing.lastName || shipping.lastName || customer.lastName || current.lastName),
+    fiscalCode,
+    vatNumber,
+    pec,
+    sdi,
+    companyName: clean(billing.company || shipping.company || current.companyName),
+    status: "order_created",
+    errorMessage: notes || current.errorMessage || null,
+  };
+}
+
 export async function loader({ request }) {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const url = new URL(request.url);
 
   const status = clean(url.searchParams.get("status")) || "orders";
@@ -164,7 +432,7 @@ export async function loader({ request }) {
 }
 
 export async function action({ request }) {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
 
   const intent = clean(formData.get("intent"));
@@ -200,6 +468,58 @@ export async function action({ request }) {
     });
 
     return json({ ok: true, intent, id: created.id, status: created.status });
+  }
+
+  if (intent === "updateFiscal") {
+    const id = clean(formData.get("id"));
+    if (!id) return json({ ok: false, error: "Richiesta non valida." }, { status: 400 });
+
+    const updated = await prisma.invoiceRequest.updateMany({
+      where: { id, shop: session.shop },
+      data: {
+        invoiceType: clean(formData.get("invoiceType")) || undefined,
+        status: clean(formData.get("status")) || undefined,
+        orderName: cleanNullable(formData.get("orderName")),
+        orderId: cleanNullable(formData.get("orderId")),
+        customerEmail: cleanNullable(formData.get("customerEmail")),
+        firstName: cleanNullable(formData.get("firstName")),
+        lastName: cleanNullable(formData.get("lastName")),
+        fiscalCode: upperNullable(formData.get("fiscalCode")),
+        companyName: cleanNullable(formData.get("companyName")),
+        countryCode: upperNullable(formData.get("countryCode")),
+        vatNumber: upperNullable(formData.get("vatNumber")),
+        pec: cleanNullable(formData.get("pec")),
+        sdi: upperNullable(formData.get("sdi")),
+        viesChecked: formBoolean(formData.get("viesChecked")),
+        viesValid: optionalBooleanFromForm(formData.get("viesValid")),
+        reverseCharge: formBoolean(formData.get("reverseCharge")),
+        taxExemptApplied: formBoolean(formData.get("taxExemptApplied")),
+        errorMessage: cleanNullable(formData.get("note")),
+      },
+    });
+
+    if (!updated.count) return json({ ok: false, error: "Richiesta non trovata." }, { status: 404 });
+    return json({ ok: true, intent, id, status: clean(formData.get("status")) || "updated" });
+  }
+
+  if (intent === "backfillOrder") {
+    const id = clean(formData.get("id"));
+    if (!id) return json({ ok: false, error: "Richiesta non valida." }, { status: 400 });
+
+    const current = await prisma.invoiceRequest.findFirst({ where: { id, shop: session.shop } });
+    if (!current) return json({ ok: false, error: "Richiesta non trovata." }, { status: 404 });
+
+    const orderId = clean(formData.get("orderId") || current.orderId);
+    const orderName = clean(formData.get("orderName") || current.orderName);
+    const order = await fetchOrderForBackfill(admin, { orderId, orderName });
+    const backfillData = buildBackfillDataFromOrder(order, current);
+
+    const updated = await prisma.invoiceRequest.update({
+      where: { id: current.id },
+      data: backfillData,
+    });
+
+    return json({ ok: true, intent, id: updated.id, status: updated.status });
   }
 
   const id = clean(formData.get("id"));
@@ -281,7 +601,7 @@ export default function InvoiceRequestsPage() {
   useEffect(() => {
     if (!fetcher.data?.ok) return;
 
-    if (fetcher.data.intent === "createManual") {
+    if (["createManual", "updateFiscal", "backfillOrder"].includes(fetcher.data.intent)) {
       setShowManualForm(false);
       revalidator.revalidate();
       return;
@@ -402,11 +722,14 @@ export default function InvoiceRequestsPage() {
                   <th style={styles.th}>RC</th>
                   <th style={styles.th}>Ordine</th>
                   <th style={styles.th}>Status</th>
+                  <th style={styles.th}>Check</th>
                   <th style={styles.th}></th>
                 </tr>
               </thead>
               <tbody>
-                {requests.map((request) => (
+                {requests.map((request) => {
+                  const missingFlags = getMissingFlags(request);
+                  return (
                   <tr key={request.id} style={styles.tr}>
                     <td style={styles.td}>{formatDate(request.createdAt)}</td>
                     <td style={styles.td}>{request.invoiceType || "—"}</td>
@@ -435,13 +758,19 @@ export default function InvoiceRequestsPage() {
                       ) : "—"}
                     </td>
                     <td style={styles.td}><StatusBadge status={request.status} /></td>
+                    <td style={styles.td}>
+                      <Badge tone={missingTone(missingFlags)}>
+                        {missingFlags.length ? `${missingFlags.length} missing` : "OK"}
+                      </Badge>
+                    </td>
                     <td style={styles.tdRight}>
                       <button type="button" style={styles.smallButton} onClick={() => setSelected(request)}>
                         View
                       </button>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -595,6 +924,7 @@ function RequestDetail({ shop, request, fetcher, embeddedSearch = "", onClose })
   })();
   const isPrivate = request.invoiceType === "private";
   const isCompany = request.invoiceType === "company";
+  const missingFlags = getMissingFlags(request);
 
   return (
     <div style={styles.drawerBackdrop} onClick={onClose}>
@@ -610,6 +940,7 @@ function RequestDetail({ shop, request, fetcher, embeddedSearch = "", onClose })
         <div style={styles.detailGrid}>
           <h3 style={styles.sectionTitle}>Richiesta</h3>
           <Detail label="Status" value={<StatusBadge status={request.status} />} />
+          <Detail label="Missing flags" value={missingFlags.length ? missingFlags.join(" · ") : "OK"} />
           <Detail label="Created" value={formatDate(request.createdAt)} />
           <Detail label="Updated" value={formatDate(request.updatedAt)} />
           <Detail label="Invoice type" value={isPrivate ? "Privato" : isCompany ? "Azienda" : request.invoiceType || "—"} />
@@ -647,7 +978,10 @@ function RequestDetail({ shop, request, fetcher, embeddedSearch = "", onClose })
           <Detail label="Note amministrative / Prodotti" value={request.errorMessage || "—"} />
         </div>
 
+        <UpdateFiscalForm request={request} fetcher={fetcher} />
+
         <div style={styles.actionsRow}>
+          <BackfillForm request={request} fetcher={fetcher} />
           <a href={printHref} target="_blank" rel="noreferrer" style={{ ...styles.actionButton, ...styles.secondaryButton, textDecoration: "none" }}>
             Stampa facsimile
           </a>
@@ -656,6 +990,107 @@ function RequestDetail({ shop, request, fetcher, embeddedSearch = "", onClose })
           <StatusForm fetcher={fetcher} id={request.id} intent="markValidated" label="Back to validated" variant="secondary" />
         </div>
       </aside>
+    </div>
+  );
+}
+
+
+function BackfillForm({ request, fetcher }) {
+  return (
+    <fetcher.Form method="post" style={{ display: "inline" }}>
+      <input type="hidden" name="intent" value="backfillOrder" />
+      <input type="hidden" name="id" value={request.id} />
+      <input type="hidden" name="orderId" value={request.orderId || ""} />
+      <input type="hidden" name="orderName" value={request.orderName || ""} />
+      <button type="submit" style={{ ...styles.actionButton, ...styles.secondaryButton }}>
+        Backfill da Shopify
+      </button>
+    </fetcher.Form>
+  );
+}
+
+function UpdateFiscalForm({ request, fetcher }) {
+  return (
+    <div style={styles.editBox}>
+      <h3 style={styles.sectionTitle}>Aggiungi / correggi dati mancanti</h3>
+      <fetcher.Form method="post" style={styles.editForm}>
+        <input type="hidden" name="intent" value="updateFiscal" />
+        <input type="hidden" name="id" value={request.id} />
+
+        <label style={styles.fieldLabel}>Tipo
+          <select name="invoiceType" defaultValue={request.invoiceType || "private"} style={styles.inputFull}>
+            <option value="private">Privato</option>
+            <option value="company">Azienda</option>
+          </select>
+        </label>
+
+        <label style={styles.fieldLabel}>Status
+          <select name="status" defaultValue={request.status || "order_created"} style={styles.inputFull}>
+            <option value="validated">Validated</option>
+            <option value="order_created">Order created</option>
+            <option value="processed">Processed</option>
+            <option value="rejected">Rejected</option>
+            <option value="failed">Failed</option>
+          </select>
+        </label>
+
+        <label style={styles.fieldLabel}>Ordine
+          <input name="orderName" defaultValue={request.orderName || ""} placeholder="#24767" style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>Order ID
+          <input name="orderId" defaultValue={request.orderId || ""} style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>Email
+          <input name="customerEmail" defaultValue={request.customerEmail || ""} style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>Nome
+          <input name="firstName" defaultValue={request.firstName || ""} style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>Cognome
+          <input name="lastName" defaultValue={request.lastName || ""} style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>Codice fiscale
+          <input name="fiscalCode" defaultValue={request.fiscalCode || ""} style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>Azienda
+          <input name="companyName" defaultValue={request.companyName || ""} style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>Paese
+          <input name="countryCode" defaultValue={request.countryCode || ""} maxLength={2} style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>VAT
+          <input name="vatNumber" defaultValue={request.vatNumber || ""} style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>PEC
+          <input name="pec" defaultValue={request.pec || ""} style={styles.inputFull} />
+        </label>
+
+        <label style={styles.fieldLabel}>SDI
+          <input name="sdi" defaultValue={request.sdi || ""} style={styles.inputFull} />
+        </label>
+
+        <label style={styles.checkboxLabel}><input type="checkbox" name="viesChecked" value="true" defaultChecked={Boolean(request.viesChecked)} /> VIES checked</label>
+        <label style={styles.checkboxLabel}><input type="checkbox" name="viesValid" value="true" defaultChecked={Boolean(request.viesValid)} /> VIES valid</label>
+        <label style={styles.checkboxLabel}><input type="checkbox" name="reverseCharge" value="true" defaultChecked={Boolean(request.reverseCharge)} /> Reverse charge</label>
+        <label style={styles.checkboxLabel}><input type="checkbox" name="taxExemptApplied" value="true" defaultChecked={Boolean(request.taxExemptApplied)} /> Tax exempt applied</label>
+
+        <label style={{ ...styles.fieldLabel, gridColumn: "1 / -1" }}>Note amministrative / snapshot
+          <textarea name="note" defaultValue={request.errorMessage || ""} rows={8} style={styles.textarea} />
+        </label>
+
+        <div style={styles.manualActions}>
+          <button type="submit" style={styles.primaryButton}>Salva correzioni</button>
+        </div>
+      </fetcher.Form>
     </div>
   );
 }
@@ -741,6 +1176,18 @@ const styles = {
   counterSubtext: {
     fontSize: 11,
     color: "#8c9196",
+  },
+  editBox: {
+    marginTop: 18,
+    padding: 14,
+    border: "1px solid #dfe3e8",
+    borderRadius: 12,
+    background: "#fafbfb",
+  },
+  editForm: {
+    display: "grid",
+    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+    gap: 12,
   },
   card: {
     background: "#fff",
