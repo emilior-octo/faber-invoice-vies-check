@@ -522,6 +522,51 @@ export async function action({ request }) {
     return json({ ok: true, intent, id: updated.id, status: updated.status });
   }
 
+  if (intent === "backfillMissingOrders") {
+    const limit = Math.min(Math.max(Number(formData.get("limit") || 50), 1), 100);
+    const candidates = await prisma.invoiceRequest.findMany({
+      where: {
+        AND: [
+          buildOrderOnlyWhere(session.shop),
+          buildMissingWhere(),
+        ],
+      },
+      orderBy: { createdAt: "asc" },
+      take: limit,
+    });
+
+    const results = [];
+
+    for (const current of candidates) {
+      try {
+        const order = await fetchOrderForBackfill(admin, {
+          orderId: clean(current.orderId),
+          orderName: clean(current.orderName),
+        });
+        const backfillData = buildBackfillDataFromOrder(order, current);
+        await prisma.invoiceRequest.update({
+          where: { id: current.id },
+          data: backfillData,
+        });
+        results.push({ id: current.id, ok: true, orderName: backfillData.orderName || current.orderName || current.orderId });
+      } catch (error) {
+        results.push({ id: current.id, ok: false, orderName: current.orderName || current.orderId || current.id, error: error?.message || "Errore backfill" });
+      }
+    }
+
+    const okCount = results.filter((item) => item.ok).length;
+    const failed = results.filter((item) => !item.ok);
+
+    return json({
+      ok: failed.length === 0,
+      intent,
+      processed: results.length,
+      updated: okCount,
+      failed: failed.length,
+      error: failed.length ? `${failed.length} backfill falliti su ${results.length}. Primo errore: ${failed[0]?.orderName}: ${failed[0]?.error}` : "",
+    });
+  }
+
   const id = clean(formData.get("id"));
 
   if (!id) {
@@ -601,7 +646,7 @@ export default function InvoiceRequestsPage() {
   useEffect(() => {
     if (!fetcher.data?.ok) return;
 
-    if (["createManual", "updateFiscal", "backfillOrder"].includes(fetcher.data.intent)) {
+    if (["createManual", "updateFiscal", "backfillOrder", "backfillMissingOrders"].includes(fetcher.data.intent)) {
       setShowManualForm(false);
       revalidator.revalidate();
       return;
@@ -686,7 +731,7 @@ export default function InvoiceRequestsPage() {
             <button type="submit" style={styles.primaryButton}>Filtra</button>
             <a href={resetHref} style={styles.secondaryLink} onClick={handleResetFilters}>Reset</a>
             <a href={exportHref} style={styles.secondaryLink}>Esporta CSV</a>
-            <a href={printAllHref} target="_blank" rel="noreferrer" style={styles.secondaryLink}>Stampa facsimili</a>
+            <a href={printAllHref} style={styles.secondaryLink}>Stampa facsimili</a>
             <button
               type="button"
               style={styles.smallButton}
@@ -695,12 +740,27 @@ export default function InvoiceRequestsPage() {
               {showManualForm ? "Chiudi inserimento" : "Crea manuale"}
             </button>
           </form>
+
+          <fetcher.Form method="post" style={styles.bulkBackfillForm}>
+            <input type="hidden" name="intent" value="backfillMissingOrders" />
+            <input type="hidden" name="limit" value="50" />
+            <button type="submit" style={{ ...styles.smallButton, ...styles.warningButton }}>
+              Backfill missing visibili/vecchi
+            </button>
+            <span style={styles.mutedText}>Aggiorna fino a 50 ordini mancanti da Shopify.</span>
+          </fetcher.Form>
         </div>
 
         {showManualForm && <ManualRequestForm fetcher={fetcher} />}
 
         {fetcher.data?.ok && fetcher.data.intent === "createManual" && (
           <div style={styles.success}>Richiesta manuale creata correttamente.</div>
+        )}
+
+        {fetcher.data?.ok && fetcher.data.intent === "backfillMissingOrders" && (
+          <div style={styles.success}>
+            Backfill completato: {fetcher.data.updated || 0} aggiornate su {fetcher.data.processed || 0} richieste.
+          </div>
         )}
 
         {fetcher.data?.error && (
@@ -982,7 +1042,7 @@ function RequestDetail({ shop, request, fetcher, embeddedSearch = "", onClose })
 
         <div style={styles.actionsRow}>
           <BackfillForm request={request} fetcher={fetcher} />
-          <a href={printHref} target="_blank" rel="noreferrer" style={{ ...styles.actionButton, ...styles.secondaryButton, textDecoration: "none" }}>
+          <a href={printHref} style={{ ...styles.actionButton, ...styles.secondaryButton, textDecoration: "none" }}>
             Stampa facsimile
           </a>
           <StatusForm fetcher={fetcher} id={request.id} intent="markProcessed" label="Mark processed" />
@@ -1010,17 +1070,51 @@ function BackfillForm({ request, fetcher }) {
 }
 
 function UpdateFiscalForm({ request, fetcher }) {
+  const initialCountry = clean(request.countryCode).toUpperCase();
+  const initialProfile = request.invoiceType === "company"
+    ? (initialCountry && initialCountry !== "IT" ? "company_foreign" : "company_it")
+    : "private";
+
+  const [fiscalProfile, setFiscalProfile] = useState(initialProfile);
+  const [countryCode, setCountryCode] = useState(initialCountry || (initialProfile === "company_foreign" ? "" : "IT"));
+
+  const isPrivate = fiscalProfile === "private";
+  const isCompanyIt = fiscalProfile === "company_it";
+  const isCompanyForeign = fiscalProfile === "company_foreign";
+  const invoiceType = isPrivate ? "private" : "company";
+  const effectiveCountryCode = isCompanyIt ? "IT" : countryCode;
+
+  function handleProfileChange(event) {
+    const nextProfile = event.target.value;
+    setFiscalProfile(nextProfile);
+
+    if (nextProfile === "company_it") {
+      setCountryCode("IT");
+    } else if (nextProfile === "company_foreign") {
+      setCountryCode(initialCountry && initialCountry !== "IT" ? initialCountry : "");
+    } else {
+      setCountryCode(initialCountry || "IT");
+    }
+  }
+
   return (
     <div style={styles.editBox}>
-      <h3 style={styles.sectionTitle}>Aggiungi / correggi dati mancanti</h3>
-      <fetcher.Form method="post" style={styles.editForm}>
+      <div style={styles.editHeaderRow}>
+        <h3 style={styles.sectionTitle}>Aggiungi / correggi dati mancanti</h3>
+        <button type="submit" form={`invoice-update-${request.id}`} style={styles.primaryButton}>Salva correzioni</button>
+      </div>
+
+      <fetcher.Form id={`invoice-update-${request.id}`} method="post" style={styles.editForm}>
         <input type="hidden" name="intent" value="updateFiscal" />
         <input type="hidden" name="id" value={request.id} />
+        <input type="hidden" name="invoiceType" value={invoiceType} />
+        <input type="hidden" name="countryCode" value={effectiveCountryCode || ""} />
 
-        <label style={styles.fieldLabel}>Tipo
-          <select name="invoiceType" defaultValue={request.invoiceType || "private"} style={styles.inputFull}>
+        <label style={styles.fieldLabel}>Profilo fiscale
+          <select value={fiscalProfile} onChange={handleProfileChange} style={styles.inputFull}>
             <option value="private">Privato</option>
-            <option value="company">Azienda</option>
+            <option value="company_it">Azienda Italia</option>
+            <option value="company_foreign">Azienda EU / estera</option>
           </select>
         </label>
 
@@ -1034,40 +1128,6 @@ function UpdateFiscalForm({ request, fetcher }) {
           </select>
         </label>
 
-        <div style={styles.fiscalBoxFull}>
-          <strong>Dati fiscali azienda</strong>
-          <span>Per aziende: VAT sempre editabile. Se paese IT, compilare anche PEC e SDI. Per aziende estere PEC/SDI possono restare vuoti.</span>
-        </div>
-
-        <label style={styles.fieldLabel}>Azienda / Ragione sociale
-          <input name="companyName" defaultValue={request.companyName || ""} style={styles.inputFull} placeholder="Es. PLURISERVICE SRL" />
-        </label>
-
-        <label style={styles.fieldLabel}>Paese fiscale
-          <input name="countryCode" defaultValue={request.countryCode || ""} maxLength={2} style={styles.inputFull} placeholder="IT, DE, FR..." />
-        </label>
-
-        <label style={styles.fieldLabel}>Partita IVA / VAT number
-          <input name="vatNumber" defaultValue={request.vatNumber || ""} style={styles.inputFull} placeholder="IT03307890784 / DE147223734" />
-        </label>
-
-        <label style={styles.fieldLabel}>PEC - solo aziende Italia
-          <input name="pec" defaultValue={request.pec || ""} style={styles.inputFull} placeholder="azienda@legalmail.it" />
-        </label>
-
-        <label style={styles.fieldLabel}>Codice SDI - solo aziende Italia
-          <input name="sdi" defaultValue={request.sdi || ""} style={styles.inputFull} placeholder="0000000 / XL13LG4" />
-        </label>
-
-        <label style={styles.fieldLabel}>Codice fiscale privato
-          <input name="fiscalCode" defaultValue={request.fiscalCode || ""} style={styles.inputFull} />
-        </label>
-
-        <div style={styles.fiscalBoxFull}>
-          <strong>Dati ordine / cliente</strong>
-          <span>Usali per collegare o correggere la richiesta quando il backfill non trova tutto automaticamente.</span>
-        </div>
-
         <label style={styles.fieldLabel}>Ordine
           <input name="orderName" defaultValue={request.orderName || ""} placeholder="#24767" style={styles.inputFull} />
         </label>
@@ -1080,18 +1140,127 @@ function UpdateFiscalForm({ request, fetcher }) {
           <input name="customerEmail" defaultValue={request.customerEmail || ""} style={styles.inputFull} />
         </label>
 
-        <label style={styles.fieldLabel}>Nome
-          <input name="firstName" defaultValue={request.firstName || ""} style={styles.inputFull} />
-        </label>
+        {isPrivate && (
+          <>
+            <div style={{ ...styles.infoBox, gridColumn: "1 / -1" }}>
+              <strong>Dati privato</strong><br />
+              Per clienti privati italiani compila il codice fiscale. Per privati esteri può bastare billing address + ordine.
+            </div>
 
-        <label style={styles.fieldLabel}>Cognome
-          <input name="lastName" defaultValue={request.lastName || ""} style={styles.inputFull} />
-        </label>
+            <label style={styles.fieldLabel}>Paese fiscale
+              <input
+                value={countryCode}
+                onChange={(event) => setCountryCode(event.target.value.toUpperCase())}
+                maxLength={2}
+                placeholder="IT"
+                style={styles.inputFull}
+              />
+            </label>
 
-        <label style={styles.checkboxLabel}><input type="checkbox" name="viesChecked" value="true" defaultChecked={Boolean(request.viesChecked)} /> VIES checked</label>
-        <label style={styles.checkboxLabel}><input type="checkbox" name="viesValid" value="true" defaultChecked={Boolean(request.viesValid)} /> VIES valid</label>
-        <label style={styles.checkboxLabel}><input type="checkbox" name="reverseCharge" value="true" defaultChecked={Boolean(request.reverseCharge)} /> Reverse charge</label>
-        <label style={styles.checkboxLabel}><input type="checkbox" name="taxExemptApplied" value="true" defaultChecked={Boolean(request.taxExemptApplied)} /> Tax exempt applied</label>
+            <label style={styles.fieldLabel}>Codice fiscale
+              <input name="fiscalCode" defaultValue={request.fiscalCode || ""} style={styles.inputFull} />
+            </label>
+
+            <label style={styles.fieldLabel}>Nome
+              <input name="firstName" defaultValue={request.firstName || ""} style={styles.inputFull} />
+            </label>
+
+            <label style={styles.fieldLabel}>Cognome
+              <input name="lastName" defaultValue={request.lastName || ""} style={styles.inputFull} />
+            </label>
+          </>
+        )}
+
+        {isCompanyIt && (
+          <>
+            <div style={{ ...styles.infoBox, gridColumn: "1 / -1" }}>
+              <strong>Dati azienda Italia</strong><br />
+              Per aziende italiane compila ragione sociale, P.IVA, PEC e/o SDI.
+            </div>
+
+            <label style={styles.fieldLabel}>Azienda / Ragione sociale
+              <input name="companyName" defaultValue={request.companyName || ""} placeholder="Es. PLURISERVICE SRL" style={styles.inputFull} />
+            </label>
+
+            <label style={styles.fieldLabel}>Paese fiscale
+              <input value="IT" readOnly style={{ ...styles.inputFull, background: "#f1f2f3" }} />
+            </label>
+
+            <label style={styles.fieldLabel}>Partita IVA
+              <input name="vatNumber" defaultValue={request.vatNumber || ""} placeholder="IT03307890784" style={styles.inputFull} />
+            </label>
+
+            <label style={styles.fieldLabel}>PEC
+              <input name="pec" defaultValue={request.pec || ""} placeholder="azienda@legalmail.it" style={styles.inputFull} />
+            </label>
+
+            <label style={styles.fieldLabel}>Codice SDI
+              <input name="sdi" defaultValue={request.sdi || ""} placeholder="XL13LG4 / 0000000" style={styles.inputFull} />
+            </label>
+          </>
+        )}
+
+        {isCompanyForeign && (
+          <>
+            <div style={{ ...styles.infoBox, gridColumn: "1 / -1" }}>
+              <strong>Dati azienda EU / estera</strong><br />
+              Per aziende estere non servono PEC/SDI. Compila paese e VAT. Se VIES valido puoi segnare reverse charge / VAT exempt.
+            </div>
+
+            <label style={styles.fieldLabel}>Azienda / Ragione sociale
+              <input name="companyName" defaultValue={request.companyName || ""} placeholder="Company name" style={styles.inputFull} />
+            </label>
+
+            <label style={styles.fieldLabel}>Paese fiscale
+              <input
+                value={countryCode}
+                onChange={(event) => setCountryCode(event.target.value.toUpperCase())}
+                maxLength={2}
+                placeholder="DE"
+                style={styles.inputFull}
+              />
+            </label>
+
+            <label style={styles.fieldLabel}>VAT number
+              <input name="vatNumber" defaultValue={request.vatNumber || ""} placeholder="DE147223734" style={styles.inputFull} />
+            </label>
+
+            <label style={styles.checkboxLabel}><input type="checkbox" name="viesChecked" value="true" defaultChecked={Boolean(request.viesChecked)} /> VIES checked</label>
+            <label style={styles.checkboxLabel}><input type="checkbox" name="viesValid" value="true" defaultChecked={Boolean(request.viesValid)} /> VIES valid</label>
+            <label style={styles.checkboxLabel}><input type="checkbox" name="reverseCharge" value="true" defaultChecked={Boolean(request.reverseCharge)} /> Reverse charge</label>
+            <label style={styles.checkboxLabel}><input type="checkbox" name="taxExemptApplied" value="true" defaultChecked={Boolean(request.taxExemptApplied)} /> Tax exempt applied</label>
+          </>
+        )}
+
+        {!isCompanyForeign && (
+          <>
+            <input type="hidden" name="viesChecked" value={request.viesChecked ? "true" : ""} />
+            <input type="hidden" name="viesValid" value={request.viesValid ? "true" : ""} />
+            <input type="hidden" name="reverseCharge" value={request.reverseCharge ? "true" : ""} />
+            <input type="hidden" name="taxExemptApplied" value={request.taxExemptApplied ? "true" : ""} />
+          </>
+        )}
+
+        {isPrivate && (
+          <>
+            <input type="hidden" name="companyName" value="" />
+            <input type="hidden" name="vatNumber" value="" />
+            <input type="hidden" name="pec" value="" />
+            <input type="hidden" name="sdi" value="" />
+          </>
+        )}
+
+        {isCompanyForeign && (
+          <>
+            <input type="hidden" name="fiscalCode" value="" />
+            <input type="hidden" name="pec" value="" />
+            <input type="hidden" name="sdi" value="" />
+          </>
+        )}
+
+        {isCompanyIt && (
+          <input type="hidden" name="fiscalCode" value="" />
+        )}
 
         <label style={{ ...styles.fieldLabel, gridColumn: "1 / -1" }}>Note amministrative / snapshot
           <textarea name="note" defaultValue={request.errorMessage || ""} rows={8} style={styles.textarea} />
@@ -1194,21 +1363,30 @@ const styles = {
     borderRadius: 12,
     background: "#fafbfb",
   },
+  editHeaderRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 12,
+    alignItems: "center",
+    marginBottom: 12,
+    position: "sticky",
+    top: 0,
+    background: "#fafbfb",
+    zIndex: 2,
+    paddingBottom: 8,
+  },
+  infoBox: {
+    padding: 12,
+    border: "1px solid #dfe3e8",
+    borderRadius: 10,
+    background: "#fff",
+    fontSize: 13,
+    lineHeight: 1.35,
+  },
   editForm: {
     display: "grid",
     gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
     gap: 12,
-  },
-  fiscalBoxFull: {
-    gridColumn: "1 / -1",
-    display: "grid",
-    gap: 4,
-    padding: "10px 12px",
-    border: "1px solid #e1e3e5",
-    borderRadius: 8,
-    background: "#f6f6f7",
-    color: "#202223",
-    fontSize: 13,
   },
   card: {
     background: "#fff",
@@ -1225,6 +1403,13 @@ const styles = {
     flexWrap: "wrap",
     gap: 10,
     alignItems: "center",
+  },
+  bulkBackfillForm: {
+    display: "flex",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 10,
+    marginTop: 10,
   },
   input: {
     minWidth: 260,
@@ -1250,6 +1435,11 @@ const styles = {
     color: "#fff",
     cursor: "pointer",
     fontWeight: 600,
+  },
+  warningButton: {
+    borderColor: "#b98900",
+    background: "#fff7d6",
+    color: "#5c3b00",
   },
   secondaryLink: {
     color: "#2c6ecb",
