@@ -1,5 +1,5 @@
 import { data as json, useFetcher, useLoaderData, useLocation, useNavigate, useRevalidator } from "react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 
@@ -578,6 +578,7 @@ export default function InvoiceRequestsPage() {
   const revalidator = useRevalidator();
   const [selected, setSelected] = useState(null);
   const [showManualForm, setShowManualForm] = useState(false);
+  const handledFetcherDataRef = useRef("");
 
   function handleFiltersSubmit(event) {
     event.preventDefault();
@@ -614,24 +615,30 @@ export default function InvoiceRequestsPage() {
   useEffect(() => {
     if (!fetcher.data?.ok) return;
 
+    const actionKey = [
+      fetcher.data.intent || "",
+      fetcher.data.id || "",
+      fetcher.data.status || "",
+      fetcher.data.updatedAt || "",
+      fetcher.data.deletedAt || "",
+      fetcher.data.createdAt || "",
+    ].join("|");
+
+    if (handledFetcherDataRef.current === actionKey) return;
+    handledFetcherDataRef.current = actionKey;
+
     if (fetcher.data.intent === "deleteInvoiceRequest") {
       setSelected(null);
       revalidator.revalidate();
       return;
     }
 
-    if (["createManual", "updateFiscal", "backfillOrder"].includes(fetcher.data.intent)) {
+    if (["createManual", "updateFiscal", "backfillOrder", "bulkBackfillMissing"].includes(fetcher.data.intent)) {
       setShowManualForm(false);
       revalidator.revalidate();
       return;
     }
-
-    if (selected?.id === fetcher.data.id) {
-      setSelected((current) =>
-        current ? { ...current, status: fetcher.data.status } : current
-      );
-    }
-  }, [fetcher.data, selected?.id, revalidator]);
+  }, [fetcher.data, revalidator]);
 
   const totalCount = Number(stats?.orderCount || 0);
   const cartCount = Number(stats?.cartCount || 0);
@@ -1336,7 +1343,8 @@ const styles = {
     color: "#8c9196",
   },
   editBox: {
-    marginTop: 18,
+    flex: "0 0 auto",
+    margin: "0 24px 18px",
     padding: 14,
     border: "1px solid #dfe3e8",
     borderRadius: 12,
@@ -1602,7 +1610,8 @@ const styles = {
     minHeight: 0,
     display: "flex",
     flexDirection: "column",
-    overflow: "hidden",
+    overflowY: "auto",
+    overflowX: "hidden",
     background: "#fff",
     boxShadow: "-16px 0 32px rgba(0,0,0,0.18)",
   },
@@ -1629,9 +1638,9 @@ const styles = {
     lineHeight: 1,
   },
   detailGrid: {
-    flex: "1 1 auto",
+    flex: "0 0 auto",
     minHeight: 0,
-    overflowY: "auto",
+    overflowY: "visible",
     display: "grid",
     gap: 10,
     padding: 24,
@@ -1664,15 +1673,16 @@ const styles = {
   },
   actionsRow: {
     flex: "0 0 auto",
-    position: "sticky",
-    bottom: 0,
+    position: "static",
     display: "flex",
     flexWrap: "wrap",
     gap: 10,
+    margin: "0 24px 24px",
     padding: 16,
-    borderTop: "1px solid #dfe3e8",
+    border: "1px solid #dfe3e8",
+    borderRadius: 12,
     background: "#fff",
-    zIndex: 2,
+    zIndex: 1,
   },
   actionButton: {
     padding: "10px 14px",
