@@ -502,6 +502,19 @@ export async function action({ request }) {
     return json({ ok: true, intent, id, status: clean(formData.get("status")) || "updated" });
   }
 
+  if (intent === "deleteInvoiceRequest") {
+    const id = clean(formData.get("id"));
+    if (!id) return json({ ok: false, error: "Richiesta non valida." }, { status: 400 });
+
+    const deleted = await prisma.invoiceRequest.deleteMany({
+      where: { id, shop: session.shop },
+    });
+
+    if (!deleted.count) return json({ ok: false, error: "Richiesta non trovata." }, { status: 404 });
+
+    return json({ ok: true, intent, id, status: "deleted" });
+  }
+
   if (intent === "backfillOrder") {
     const id = clean(formData.get("id"));
     if (!id) return json({ ok: false, error: "Richiesta non valida." }, { status: 400 });
@@ -600,6 +613,12 @@ export default function InvoiceRequestsPage() {
 
   useEffect(() => {
     if (!fetcher.data?.ok) return;
+
+    if (fetcher.data.intent === "deleteInvoiceRequest") {
+      setSelected(null);
+      revalidator.revalidate();
+      return;
+    }
 
     if (["createManual", "updateFiscal", "backfillOrder"].includes(fetcher.data.intent)) {
       setShowManualForm(false);
@@ -985,9 +1004,7 @@ function RequestDetail({ shop, request, fetcher, embeddedSearch = "", onClose })
           <a href={printHref} style={{ ...styles.actionButton, ...styles.secondaryButton, textDecoration: "none" }}>
             Stampa facsimile
           </a>
-          <StatusForm fetcher={fetcher} id={request.id} intent="markProcessed" label="Mark processed" />
-          <StatusForm fetcher={fetcher} id={request.id} intent="markRejected" label="Reject" variant="danger" />
-          <StatusForm fetcher={fetcher} id={request.id} intent="markValidated" label="Back to validated" variant="secondary" />
+          <DeleteInvoiceRequestForm request={request} fetcher={fetcher} />
         </div>
       </aside>
     </div>
@@ -1004,6 +1021,32 @@ function BackfillForm({ request, fetcher }) {
       <input type="hidden" name="orderName" value={request.orderName || ""} />
       <button type="submit" style={{ ...styles.actionButton, ...styles.secondaryButton }}>
         Backfill da Shopify
+      </button>
+    </fetcher.Form>
+  );
+}
+
+function DeleteInvoiceRequestForm({ request, fetcher }) {
+  const isDeleting =
+    fetcher.state !== "idle" &&
+    fetcher.formData?.get("intent") === "deleteInvoiceRequest" &&
+    fetcher.formData?.get("id") === request.id;
+
+  function handleDeleteSubmit(event) {
+    const label = request.orderName || request.customerEmail || request.companyName || request.id;
+    const confirmed = window.confirm(`Eliminare definitivamente questa richiesta fattura?\n\n${label}\n\nL'azione non può essere annullata.`);
+
+    if (!confirmed) {
+      event.preventDefault();
+    }
+  }
+
+  return (
+    <fetcher.Form method="post" style={{ display: "inline", marginLeft: "auto" }} onSubmit={handleDeleteSubmit}>
+      <input type="hidden" name="intent" value="deleteInvoiceRequest" />
+      <input type="hidden" name="id" value={request.id} />
+      <button type="submit" style={{ ...styles.actionButton, ...styles.dangerButton }} disabled={isDeleting}>
+        {isDeleting ? "Elimino..." : "Elimina richiesta"}
       </button>
     </fetcher.Form>
   );
@@ -1029,6 +1072,14 @@ function UpdateFiscalForm({ request, fetcher }) {
   const isCompanyIt = fiscalProfile === "company_it";
   const isCompanyForeign = fiscalProfile === "company_foreign";
   const derivedInvoiceType = isPrivate ? "private" : "company";
+  const isSavingFiscal =
+    fetcher.state !== "idle" &&
+    fetcher.formData?.get("intent") === "updateFiscal" &&
+    fetcher.formData?.get("id") === request.id;
+  const fiscalSaved =
+    fetcher.data?.ok &&
+    fetcher.data?.intent === "updateFiscal" &&
+    fetcher.data?.id === request.id;
 
   return (
     <div style={styles.editBox}>
@@ -1041,9 +1092,13 @@ function UpdateFiscalForm({ request, fetcher }) {
             Scegli il profilo fiscale: i campi cambiano automaticamente. PEC e SDI sono richiesti solo per aziende italiane.
           </p>
         </div>
-        <button type="submit" form={`update-fiscal-${request.id}`} style={styles.primaryButton}>
-          Salva correzioni
-        </button>
+        <div style={styles.saveHeaderActions}>
+          {isSavingFiscal ? <span style={styles.savingPill}>Salvataggio...</span> : null}
+          {!isSavingFiscal && fiscalSaved ? <span style={styles.savedPill}>Salvato</span> : null}
+          <button type="submit" form={`update-fiscal-${request.id}`} style={styles.primaryButton}>
+            Salva correzioni
+          </button>
+        </div>
       </div>
 
       <fetcher.Form id={`update-fiscal-${request.id}`} method="post" style={styles.editForm}>
@@ -1208,29 +1263,12 @@ function UpdateFiscalForm({ request, fetcher }) {
         </label>
 
         <div style={styles.manualActions}>
+          {isSavingFiscal ? <span style={styles.savingPill}>Salvataggio...</span> : null}
+          {!isSavingFiscal && fiscalSaved ? <span style={styles.savedPill}>Salvato</span> : null}
           <button type="submit" style={styles.primaryButton}>Salva correzioni</button>
         </div>
       </fetcher.Form>
     </div>
-  );
-}
-
-function StatusForm({ fetcher, id, intent, label, variant = "primary" }) {
-  return (
-    <fetcher.Form method="post">
-      <input type="hidden" name="intent" value={intent} />
-      <input type="hidden" name="id" value={id} />
-      <button
-        type="submit"
-        style={{
-          ...styles.actionButton,
-          ...(variant === "danger" ? styles.dangerButton : {}),
-          ...(variant === "secondary" ? styles.secondaryButton : {}),
-        }}
-      >
-        {label}
-      </button>
-    </fetcher.Form>
   );
 }
 
@@ -1310,6 +1348,34 @@ const styles = {
     gap: 12,
     alignItems: "flex-start",
     marginBottom: 12,
+  },
+  saveHeaderActions: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    flexShrink: 0,
+  },
+  savedPill: {
+    display: "inline-flex",
+    alignItems: "center",
+    padding: "6px 10px",
+    borderRadius: 999,
+    background: "#e3f1df",
+    color: "#108043",
+    fontSize: 13,
+    fontWeight: 700,
+    whiteSpace: "nowrap",
+  },
+  savingPill: {
+    display: "inline-flex",
+    alignItems: "center",
+    padding: "6px 10px",
+    borderRadius: 999,
+    background: "#eef4ff",
+    color: "#2c6ecb",
+    fontSize: 13,
+    fontWeight: 700,
+    whiteSpace: "nowrap",
   },
   helpText: {
     margin: "4px 0 0",
