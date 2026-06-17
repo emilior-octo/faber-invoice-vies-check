@@ -10,8 +10,6 @@ const EU_COUNTRIES = new Set([
   "NL", "PL", "PT", "RO", "SE", "SI", "SK",
 ]);
 
-const EU_REVERSE_CHARGE = "EU_REVERSE_CHARGE_EXEMPTION_RULE";
-
 function responseJson(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
     status,
@@ -48,15 +46,32 @@ function toCustomerGid(customerId) {
   return raw.startsWith("gid://") ? raw : `gid://shopify/Customer/${raw}`;
 }
 
-function escapeShopifySearch(value) {
-  return clean(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+function stringifyError(error) {
+  if (!error) return "";
+  if (typeof error === "string") return error;
+  return error.message || JSON.stringify(error);
 }
 
-function graphQLErrors(data) {
-  const errors = data?.errors;
-  if (!errors) return [];
-  if (Array.isArray(errors)) return errors.map((error) => error?.message).filter(Boolean);
-  return [String(errors)];
+function isViesTechnicalFailure(viesResponse) {
+  if (!viesResponse || typeof viesResponse !== "object") return false;
+
+  if (viesResponse.actionSucceed === false) return true;
+  if (Array.isArray(viesResponse.errorWrappers) && viesResponse.errorWrappers.length > 0) return true;
+  if (viesResponse.error || viesResponse.faultstring || viesResponse.faultCode) return true;
+
+  return false;
+}
+
+function getViesErrorMessage(viesResponse) {
+  const wrappers = viesResponse?.errorWrappers || [];
+  if (Array.isArray(wrappers) && wrappers.length) {
+    return wrappers
+      .map((wrapper) => wrapper?.message || wrapper?.error || wrapper?.code || JSON.stringify(wrapper))
+      .filter(Boolean)
+      .join(" | ");
+  }
+
+  return viesResponse?.error || viesResponse?.faultstring || viesResponse?.faultCode || "VIES unavailable";
 }
 
 async function readJson(request) {
@@ -70,24 +85,14 @@ async function readJson(request) {
   return Object.fromEntries(formData.entries());
 }
 
-function makeHandledError(message, status = 500, details = {}) {
-  const error = new Error(message);
-  error.status = status;
-  error.details = details;
-  return error;
-}
-
 async function checkVies(countryCode, vatNumber) {
-  // Defensive normalization directly before the VIES request.
-  // VIES wants countryCode separated from vatNumber, so DE118860726 must become:
-  // { countryCode: "DE", vatNumber: "118860726" }
   const normalized = normalizeVat(countryCode, vatNumber);
   const payload = {
     countryCode: normalized.countryCode,
     vatNumber: normalized.vatNumber,
   };
 
-  console.info("[Invoice Request] VIES request payload", payload);
+  console.log("[Invoice Request] VIES request payload", payload);
 
   const response = await fetch("https://ec.europa.eu/taxation_customs/vies/rest-api/check-vat-number", {
     method: "POST",
@@ -101,14 +106,23 @@ async function checkVies(countryCode, vatNumber) {
   let data = null;
   try {
     data = await response.json();
-  } catch (jsonError) {
-    console.error("[Invoice Request] VIES response JSON parse failed", {
-      status: response.status,
-      message: jsonError?.message,
-    });
+  } catch (error) {
+    const text = await response.text().catch(() => "");
+    data = {
+      actionSucceed: false,
+      error: `Unable to parse VIES response: ${stringifyError(error)}`,
+      raw: text,
+    };
   }
 
-  console.info("[Invoice Request] VIES response", {
+  const enriched = {
+    ...data,
+    _requestPayload: payload,
+    _httpStatus: response.status,
+    _httpOk: response.ok,
+  };
+
+  console.log("[Invoice Request] VIES response", {
     status: response.status,
     ok: response.ok,
     payload,
@@ -116,16 +130,14 @@ async function checkVies(countryCode, vatNumber) {
   });
 
   if (!response.ok) {
-    throw makeHandledError(`VIES request failed with status ${response.status}`, 502, {
-      viesPayload: payload,
-      viesResponse: data,
-    });
+    return {
+      ...enriched,
+      actionSucceed: false,
+      error: `VIES request failed with HTTP status ${response.status}`,
+    };
   }
 
-  return {
-    ...(data || {}),
-    _requestPayload: payload,
-  };
+  return enriched;
 }
 
 async function setCustomerMetafields(admin, customerGid, fields) {
@@ -153,138 +165,84 @@ async function setCustomerMetafields(admin, customerGid, fields) {
 
   const response = await admin.graphql(mutation, { variables: { metafields } });
   const data = await response.json();
-  const topLevelErrors = graphQLErrors(data);
   const errors = data?.data?.metafieldsSet?.userErrors || [];
 
-  if (topLevelErrors.length || errors.length) {
-    throw new Error([
-      ...topLevelErrors,
-      ...errors.map((error) => error.message),
-    ].join(" | "));
+  if (errors.length) {
+    throw new Error(errors.map((error) => error.message).join(" | "));
   }
 }
 
 async function findCustomerByEmail(admin, email) {
-  const cleanedEmail = cleanEmailLike(email);
-  if (!cleanedEmail) return null;
+  const cleanEmail = cleanEmailLike(email);
+  if (!cleanEmail) return "";
 
   const query = `#graphql
     query FindCustomerByEmail($query: String!) {
       customers(first: 1, query: $query) {
-        nodes {
-          id
-          email
-          taxExempt
-          taxExemptions
+        edges {
+          node { id email }
         }
       }
     }
   `;
 
   const response = await admin.graphql(query, {
-    variables: { query: `email:${escapeShopifySearch(cleanedEmail)}` },
+    variables: { query: `email:${cleanEmail}` },
   });
 
   const data = await response.json();
-  const topLevelErrors = graphQLErrors(data);
-  if (topLevelErrors.length) {
-    throw new Error(topLevelErrors.join(" | "));
-  }
+  const customer = data?.data?.customers?.edges?.[0]?.node;
 
-  return data?.data?.customers?.nodes?.[0] || null;
+  return customer?.id || "";
 }
 
-async function createCustomerByEmail(admin, { email, firstName, lastName, companyName }) {
-  const cleanedEmail = cleanEmailLike(email);
-  if (!cleanedEmail) return null;
+async function createCustomerForInvoice(admin, { email, firstName, lastName, companyName }) {
+  const cleanEmail = cleanEmailLike(email);
+  if (!cleanEmail) return "";
 
   const mutation = `#graphql
     mutation CreateInvoiceCustomer($input: CustomerInput!) {
       customerCreate(input: $input) {
-        customer {
-          id
-          email
-          taxExempt
-          taxExemptions
-        }
+        customer { id email }
         userErrors { field message }
       }
     }
   `;
 
-  const input = {
-    email: cleanedEmail,
-    firstName: clean(firstName) || undefined,
-    lastName: clean(lastName) || undefined,
-    note: clean(companyName)
-      ? `Created by Invoice Request / VIES Check for ${clean(companyName)}`
-      : "Created by Invoice Request / VIES Check",
-  };
+  const response = await admin.graphql(mutation, {
+    variables: {
+      input: {
+        email: cleanEmail,
+        firstName: clean(firstName) || undefined,
+        lastName: clean(lastName) || clean(companyName) || undefined,
+        tags: ["invoice_request", "eu_reverse_charge_candidate"],
+      },
+    },
+  });
 
-  const response = await admin.graphql(mutation, { variables: { input } });
   const data = await response.json();
-  const topLevelErrors = graphQLErrors(data);
-  const userErrors = data?.data?.customerCreate?.userErrors || [];
+  const errors = data?.data?.customerCreate?.userErrors || [];
 
-  if (topLevelErrors.length) {
-    throw new Error(topLevelErrors.join(" | "));
-  }
+  if (errors.length) {
+    const message = errors.map((error) => error.message).join(" | ");
+    console.warn("[Invoice Request] customerCreate failed", { email: cleanEmail, errors });
 
-  if (userErrors.length) {
-    const message = userErrors.map((error) => error.message).join(" | ");
-
-    // If Shopify says the email already exists, race/fallback to lookup.
-    if (/already|taken|exists/i.test(message)) {
-      const existing = await findCustomerByEmail(admin, cleanedEmail);
-      if (existing?.id) return existing;
-    }
+    const existing = await findCustomerByEmail(admin, cleanEmail);
+    if (existing) return existing;
 
     throw new Error(message);
   }
 
-  return data?.data?.customerCreate?.customer || null;
+  return data?.data?.customerCreate?.customer?.id || "";
 }
 
-async function ensureCustomerForReverseCharge(admin, { customerGid, email, firstName, lastName, companyName }) {
-  if (customerGid) {
-    return {
-      id: customerGid,
-      email: cleanEmailLike(email),
-      created: false,
-      foundByEmail: false,
-    };
-  }
+async function resolveCustomerForTaxExemption(admin, { customerGid, email, firstName, lastName, companyName }) {
+  if (customerGid) return customerGid;
 
-  const cleanedEmail = cleanEmailLike(email);
-  if (!cleanedEmail) {
-    throw new Error("Per applicare il reverse charge automatico è obbligatoria l'email aziendale.");
-  }
+  const found = await findCustomerByEmail(admin, email);
+  if (found) return found;
 
-  const existing = await findCustomerByEmail(admin, cleanedEmail);
-  if (existing?.id) {
-    return {
-      ...existing,
-      created: false,
-      foundByEmail: true,
-    };
-  }
-
-  const created = await createCustomerByEmail(admin, {
-    email: cleanedEmail,
-    firstName,
-    lastName,
-    companyName,
-  });
-
-  if (!created?.id) {
-    throw new Error("Non sono riuscito a creare il cliente Shopify per applicare il reverse charge.");
-  }
-
-  return {
-    ...created,
-    created: true,
-    foundByEmail: true,
-  };
+  return await createCustomerForInvoice(admin, { email, firstName, lastName, companyName });
 }
 
 async function applyReverseCharge(admin, customerGid) {
@@ -302,7 +260,6 @@ async function applyReverseCharge(admin, customerGid) {
       customerUpdate(input: $input) {
         customer {
           id
-          email
           taxExempt
           taxExemptions
         }
@@ -319,28 +276,22 @@ async function applyReverseCharge(admin, customerGid) {
       input: {
         id: customerGid,
         taxExempt: true,
-        taxExemptions: [EU_REVERSE_CHARGE],
+        taxExemptions: ["EU_REVERSE_CHARGE_EXEMPTION_RULE"],
       },
     },
   });
 
   const data = await response.json();
-  const topLevelErrors = graphQLErrors(data);
-  const userErrors = data?.data?.customerUpdate?.userErrors || [];
+  const errors = data?.data?.customerUpdate?.userErrors || [];
 
-  if (topLevelErrors.length || userErrors.length) {
-    const message = [
-      ...topLevelErrors,
-      ...userErrors.map((error) => `${(error.field || []).join(".")}: ${error.message}`),
-    ].join(" | ");
-
+  if (errors.length) {
     console.error("[Invoice Request] customerUpdate tax exemption failed", {
       customerGid,
-      message,
+      errors,
       data,
     });
 
-    throw new Error(message || "Shopify customer tax exemption update failed.");
+    throw new Error(errors.map((error) => error.message).join(" | "));
   }
 
   const customer = data?.data?.customerUpdate?.customer;
@@ -349,20 +300,19 @@ async function applyReverseCharge(admin, customerGid) {
 
   const applied =
     customerTaxExempt === true &&
-    taxExemptions.includes(EU_REVERSE_CHARGE);
+    taxExemptions.includes("EU_REVERSE_CHARGE_EXEMPTION_RULE");
 
-  if (!applied) {
-    console.error("[Invoice Request] tax exemption not confirmed after customerUpdate", {
-      customerGid,
-      customer,
-    });
-  }
+  console.log("[Invoice Request] customer tax exemption result", {
+    customerGid,
+    applied,
+    customerTaxExempt,
+    taxExemptions,
+  });
 
   return {
     applied,
     customerTaxExempt,
     customerTaxExemptions: taxExemptions,
-    customerEmail: customer?.email || "",
     error: applied ? "" : "EU reverse charge exemption was not confirmed on customer.",
   };
 }
@@ -408,18 +358,18 @@ export async function action({ request }) {
     return responseJson({ ok: false, error: "App proxy unavailable" }, 401);
   }
 
-  const body = await readJson(request);
   const url = new URL(request.url);
   const proxyCustomerId = clean(url.searchParams.get("logged_in_customer_id"));
+  const proxyCustomerGid = toCustomerGid(proxyCustomerId);
+
+  const body = await readJson(request);
 
   const invoiceType = clean(body.invoiceType);
   const cartToken = clean(body.cartToken);
   const checkoutToken = clean(body.checkoutToken);
-  // App Proxy passes the logged-in customer id in the query string, not always in the POST body.
-  // Use it as fallback so reverse-charge can be applied to the real Shopify customer.
-  const customerId = clean(body.customerId) || proxyCustomerId;
-  const originalCustomerGid = toCustomerGid(customerId);
-  const customerEmail = cleanEmailLike(body.customerEmail);
+  const bodyCustomerId = clean(body.customerId);
+  const originalCustomerGid = toCustomerGid(bodyCustomerId) || proxyCustomerGid;
+  const customerEmail = cleanEmailLike(body.customerEmail || body.email);
 
   const fiscalCode = cleanUpper(body.fiscalCode);
   const pec = cleanEmailLike(body.pec);
@@ -442,16 +392,15 @@ export async function action({ request }) {
   }
 
   let customerGid = originalCustomerGid;
-  let preparedCustomer = null;
   let viesChecked = false;
   let viesValid = null;
   let viesRawResponse = null;
   let reverseCharge = false;
   let taxExemptApplied = false;
-  let taxExemptCustomerPrepared = false;
   let requiresLoginForTaxExemption = false;
-  let customerTaxExempt = false;
-  let customerTaxExemptions = [];
+  let customerPreparedByEmail = false;
+  let pendingManualReview = false;
+  let noticeMessage = "";
 
   try {
     const shouldCheckVies =
@@ -463,47 +412,92 @@ export async function action({ request }) {
     if (shouldCheckVies) {
       viesChecked = true;
       viesRawResponse = await checkVies(countryCode, vatNumber);
-      viesValid = Boolean(viesRawResponse?.valid);
-      reverseCharge = viesValid === true;
 
-      console.info("[Invoice Request] VIES result", {
+      console.log("[Invoice Request] VIES result", {
         inputCountryCode: countryCode,
         inputVatNumber: vatNumber,
         fullVatNumber,
-        viesPayload: viesRawResponse?._requestPayload || null,
-        valid: viesValid,
+        viesPayload: viesRawResponse?._requestPayload,
+        valid: viesRawResponse?.valid,
+        actionSucceed: viesRawResponse?.actionSucceed,
         response: viesRawResponse,
       });
 
-      if (!viesValid) {
-        throw makeHandledError(`Partita IVA non valida su VIES (${fullVatNumber}).`, 400, {
-          viesPayload: viesRawResponse?._requestPayload || null,
-          viesResponse: viesRawResponse,
-        });
-      }
+      if (isViesTechnicalFailure(viesRawResponse)) {
+        pendingManualReview = true;
+        viesValid = null;
+        reverseCharge = false;
+        taxExemptApplied = false;
+        noticeMessage = `VIES temporaneamente non disponibile o non conclusivo (${getViesErrorMessage(viesRawResponse)}). Richiesta salvata per verifica manuale.`;
+      } else {
+        viesValid = Boolean(viesRawResponse?.valid);
+        reverseCharge = viesValid === true;
 
-      if (reverseCharge) {
-        preparedCustomer = await ensureCustomerForReverseCharge(admin, {
-          customerGid,
-          email: customerEmail,
-          firstName,
-          lastName,
-          companyName,
-        });
+        if (!viesValid) {
+          const invoiceRequest = await createOrUpdateInvoiceRequest({
+            shop: session.shop,
+            cartToken,
+            data: {
+              cartToken,
+              checkoutToken,
+              customerId: customerGid || bodyCustomerId,
+              customerEmail,
+              invoiceType,
+              countryCode,
+              fiscalCode,
+              vatNumber: fullVatNumber,
+              pec,
+              sdi,
+              companyName,
+              firstName,
+              lastName,
+              viesChecked,
+              viesValid,
+              viesRawResponse: viesRawResponse ? JSON.stringify(viesRawResponse) : null,
+              reverseCharge: false,
+              taxExemptApplied: false,
+              status: "failed",
+              errorMessage: `Partita IVA non valida su VIES (${fullVatNumber}).`,
+            },
+          });
 
-        customerGid = preparedCustomer?.id || customerGid;
+          return responseJson({
+            ok: false,
+            invoiceRequestId: invoiceRequest.id,
+            error: `Partita IVA non valida su VIES (${fullVatNumber}).`,
+            invoiceType,
+            vatNumber: fullVatNumber,
+            viesChecked,
+            viesValid,
+            reverseCharge: false,
+            taxExemptApplied: false,
+          }, 400);
+        }
 
-        const taxExemptResult = await applyReverseCharge(admin, customerGid);
-        taxExemptApplied = Boolean(taxExemptResult.applied);
-        taxExemptCustomerPrepared = taxExemptApplied;
-        customerTaxExempt = Boolean(taxExemptResult.customerTaxExempt);
-        customerTaxExemptions = taxExemptResult.customerTaxExemptions || [];
+        if (reverseCharge) {
+          customerGid = await resolveCustomerForTaxExemption(admin, {
+            customerGid,
+            email: customerEmail,
+            firstName,
+            lastName,
+            companyName,
+          });
 
-        if (!taxExemptApplied) {
-          throw new Error(
-            taxExemptResult.error ||
-              "VAT number is valid, but VAT exemption could not be applied to the customer."
-          );
+          customerPreparedByEmail = !originalCustomerGid && Boolean(customerGid);
+
+          if (customerGid) {
+            const taxExemptResult = await applyReverseCharge(admin, customerGid);
+            taxExemptApplied = Boolean(taxExemptResult.applied);
+
+            if (!taxExemptApplied) {
+              pendingManualReview = true;
+              noticeMessage = taxExemptResult.error || "VAT valido, ma esenzione non confermata sul customer.";
+            }
+          } else {
+            requiresLoginForTaxExemption = true;
+            pendingManualReview = true;
+            noticeMessage = "VAT valido, ma serve email/login per preparare il customer tax exempt.";
+          }
         }
       }
     }
@@ -524,13 +518,19 @@ export async function action({ request }) {
       });
     }
 
+    const status = pendingManualReview
+      ? "pending_review"
+      : invoiceType === "private"
+        ? "registered"
+        : "validated";
+
     const invoiceRequest = await createOrUpdateInvoiceRequest({
       shop: session.shop,
       cartToken,
       data: {
         cartToken,
         checkoutToken,
-        customerId: customerGid || customerId,
+        customerId: customerGid || bodyCustomerId || proxyCustomerGid,
         customerEmail,
         invoiceType,
         countryCode,
@@ -546,8 +546,8 @@ export async function action({ request }) {
         viesRawResponse: viesRawResponse ? JSON.stringify(viesRawResponse) : null,
         reverseCharge,
         taxExemptApplied,
-        status: invoiceType === "private" ? "registered" : "validated",
-        errorMessage: null,
+        status,
+        errorMessage: noticeMessage || null,
       },
     });
 
@@ -556,19 +556,14 @@ export async function action({ request }) {
       invoiceRequestId: invoiceRequest.id,
       invoiceType,
       vatNumber: fullVatNumber,
-      customerEmail,
-      customerId: customerGid || customerId,
-      customerCreated: Boolean(preparedCustomer?.created),
-      customerFoundByEmail: Boolean(preparedCustomer?.foundByEmail),
       viesChecked,
       viesValid,
       reverseCharge,
       taxExemptApplied,
-      taxExemptCustomerPrepared,
-      customerTaxExempt,
-      customerTaxExemptions,
       requiresLoginForTaxExemption,
-      mustUseSameEmailAtCheckout: Boolean(reverseCharge && customerEmail),
+      customerPreparedByEmail,
+      pendingManualReview,
+      message: noticeMessage,
     });
   } catch (error) {
     console.error("[Invoice Request] validate failed", {
@@ -577,7 +572,7 @@ export async function action({ request }) {
       invoiceType,
       countryCode,
       vatNumber: fullVatNumber,
-      customerId: customerGid || customerId,
+      customerId: customerGid || bodyCustomerId,
       proxyCustomerId,
       originalCustomerGid,
       customerEmail,
@@ -594,7 +589,7 @@ export async function action({ request }) {
       data: {
         cartToken,
         checkoutToken,
-        customerId: customerGid || customerId,
+        customerId: customerGid || bodyCustomerId || proxyCustomerGid,
         customerEmail,
         invoiceType,
         countryCode,
@@ -615,16 +610,10 @@ export async function action({ request }) {
       },
     });
 
-    const responseStatus = Number(error?.status || 500);
-
     return responseJson({
       ok: false,
       invoiceRequestId: invoiceRequest.id,
       error: error?.message || "Errore validazione fattura.",
-      errorDetails: error?.details || null,
-      reverseCharge,
-      taxExemptApplied,
-      requiresLoginForTaxExemption,
-    }, responseStatus >= 400 && responseStatus < 600 ? responseStatus : 500);
+    }, 500);
   }
 }
