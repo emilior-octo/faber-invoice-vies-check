@@ -10,6 +10,8 @@ const EU_COUNTRIES = new Set([
   "NL", "PL", "PT", "RO", "SE", "SI", "SK",
 ]);
 
+const EU_REVERSE_CHARGE_EXEMPTION = "EU_REVERSE_CHARGE_EXEMPTION_RULE";
+
 function responseJson(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
     status,
@@ -106,33 +108,100 @@ async function setCustomerMetafields(admin, customerGid, fields) {
   }
 }
 
+async function readCustomerTaxState(admin, customerGid) {
+  if (!customerGid) {
+    return {
+      customerTaxExempt: false,
+      customerTaxExemptions: [],
+    };
+  }
+
+  const query = `#graphql
+    query ReadCustomerTaxState($id: ID!) {
+      customer(id: $id) {
+        id
+        taxExempt
+        taxExemptions
+      }
+    }
+  `;
+
+  const response = await admin.graphql(query, {
+    variables: { id: customerGid },
+  });
+
+  const data = await response.json();
+  const customer = data?.data?.customer;
+
+  return {
+    customerTaxExempt: Boolean(customer?.taxExempt),
+    customerTaxExemptions: customer?.taxExemptions || [],
+  };
+}
+
 async function applyReverseCharge(admin, customerGid) {
-  if (!customerGid) return false;
+  if (!customerGid) {
+    return {
+      applied: false,
+      customerTaxExempt: false,
+      customerTaxExemptions: [],
+      error: "Missing customer ID",
+    };
+  }
 
   const mutation = `#graphql
-    mutation AddEuReverseCharge($customerId: ID!, $taxExemptions: [TaxExemption!]!) {
-      customerAddTaxExemptions(customerId: $customerId, taxExemptions: $taxExemptions) {
-        customer { id taxExempt taxExemptions }
-        userErrors { field message }
+    mutation ApplyEuReverseCharge($input: CustomerInput!) {
+      customerUpdate(input: $input) {
+        customer {
+          id
+          taxExempt
+          taxExemptions
+        }
+        userErrors {
+          field
+          message
+        }
       }
     }
   `;
 
   const response = await admin.graphql(mutation, {
     variables: {
-      customerId: customerGid,
-      taxExemptions: ["EU_REVERSE_CHARGE_EXEMPTION_RULE"],
+      input: {
+        id: customerGid,
+        taxExempt: true,
+        taxExemptions: [EU_REVERSE_CHARGE_EXEMPTION],
+      },
     },
   });
 
   const data = await response.json();
-  const errors = data?.data?.customerAddTaxExemptions?.userErrors || [];
+  const errors = data?.data?.customerUpdate?.userErrors || [];
 
   if (errors.length) {
     throw new Error(errors.map((error) => error.message).join(" | "));
   }
 
-  return true;
+  const customerFromMutation = data?.data?.customerUpdate?.customer;
+  let customerTaxExempt = Boolean(customerFromMutation?.taxExempt);
+  let customerTaxExemptions = customerFromMutation?.taxExemptions || [];
+
+  // Re-read after update: this avoids trusting only the mutation payload and gives us
+  // the real customer tax state before the customer is sent to checkout.
+  const confirmed = await readCustomerTaxState(admin, customerGid);
+  customerTaxExempt = confirmed.customerTaxExempt;
+  customerTaxExemptions = confirmed.customerTaxExemptions;
+
+  const applied =
+    customerTaxExempt === true &&
+    customerTaxExemptions.includes(EU_REVERSE_CHARGE_EXEMPTION);
+
+  return {
+    applied,
+    customerTaxExempt,
+    customerTaxExemptions,
+    error: applied ? "" : "EU reverse charge exemption was not confirmed on customer.",
+  };
 }
 
 async function createOrUpdateInvoiceRequest({ shop, cartToken, data }) {
@@ -211,6 +280,8 @@ export async function action({ request }) {
   let reverseCharge = false;
   let taxExemptApplied = false;
   let requiresLoginForTaxExemption = false;
+  let customerTaxExempt = false;
+  let customerTaxExemptions = [];
 
   try {
     const shouldCheckVies =
@@ -230,7 +301,17 @@ export async function action({ request }) {
       }
 
       if (reverseCharge && customerGid) {
-        taxExemptApplied = await applyReverseCharge(admin, customerGid);
+        const taxExemptResult = await applyReverseCharge(admin, customerGid);
+        taxExemptApplied = Boolean(taxExemptResult.applied);
+        customerTaxExempt = Boolean(taxExemptResult.customerTaxExempt);
+        customerTaxExemptions = taxExemptResult.customerTaxExemptions || [];
+
+        if (!taxExemptApplied) {
+          throw new Error(
+            taxExemptResult.error ||
+              "VAT number is valid, but VAT exemption could not be applied to the customer."
+          );
+        }
       } else if (reverseCharge && !customerGid) {
         requiresLoginForTaxExemption = true;
       }
@@ -248,6 +329,9 @@ export async function action({ request }) {
         vies_checked: String(viesChecked),
         vies_valid: viesValid === null ? "" : String(viesValid),
         reverse_charge: String(reverseCharge),
+        tax_exempt_applied: String(taxExemptApplied),
+        customer_tax_exempt: String(customerTaxExempt),
+        customer_tax_exemptions: customerTaxExemptions.join(","),
       });
     }
 
@@ -287,6 +371,8 @@ export async function action({ request }) {
       viesValid,
       reverseCharge,
       taxExemptApplied,
+      customerTaxExempt,
+      customerTaxExemptions,
       requiresLoginForTaxExemption,
     });
   } catch (error) {
@@ -321,6 +407,15 @@ export async function action({ request }) {
       ok: false,
       invoiceRequestId: invoiceRequest.id,
       error: error?.message || "Errore validazione fattura.",
+      invoiceType,
+      vatNumber: fullVatNumber,
+      viesChecked,
+      viesValid,
+      reverseCharge,
+      taxExemptApplied,
+      customerTaxExempt,
+      customerTaxExemptions,
+      requiresLoginForTaxExemption,
     }, 500);
   }
 }
