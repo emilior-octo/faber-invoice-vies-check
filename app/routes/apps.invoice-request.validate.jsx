@@ -1,8 +1,11 @@
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
+import soap from "soap";
 
 const STORE_COUNTRY_CODE = (process.env.STORE_COUNTRY_CODE || "IT").toUpperCase();
 const ENABLE_VIES_CHECK = (process.env.ENABLE_VIES_CHECK || "true") === "true";
+const VIES_WSDL = "https://ec.europa.eu/taxation_customs/vies/checkVatService.wsdl";
+const EU_REVERSE_CHARGE_EXEMPTION = "EU_REVERSE_CHARGE_EXEMPTION_RULE";
 
 const EU_COUNTRIES = new Set([
   "AT", "BE", "BG", "CY", "CZ", "DE", "DK", "EE", "EL", "ES",
@@ -40,19 +43,14 @@ function normalizeVat(countryCode, vatNumber) {
   return { countryCode: country, vatNumber: vat };
 }
 
+function normalizeFullVat(value) {
+  return cleanUpper(value).replace(/[\s.\-_/]/g, "");
+}
+
 function toCustomerGid(customerId) {
   const raw = clean(customerId);
   if (!raw) return "";
   return raw.startsWith("gid://") ? raw : `gid://shopify/Customer/${raw}`;
-}
-
-function getProxyCustomerId(request) {
-  const url = new URL(request.url);
-  return clean(url.searchParams.get("logged_in_customer_id"));
-}
-
-function fullVat(countryCode, vatNumber) {
-  return vatNumber ? `${countryCode}${vatNumber}` : "";
 }
 
 async function readJson(request) {
@@ -66,30 +64,43 @@ async function readJson(request) {
   return Object.fromEntries(formData.entries());
 }
 
-/**
- * VIES check restored to the original working implementation.
- * Important: pass countryCode and vatNumber separately; vatNumber must not include country prefix.
- */
 async function checkVies(countryCode, vatNumber) {
   const normalized = normalizeVat(countryCode, vatNumber);
 
-  const response = await fetch("https://ec.europa.eu/taxation_customs/vies/rest-api/check-vat-number", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: JSON.stringify({
-      countryCode: normalized.countryCode,
-      vatNumber: normalized.vatNumber,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`VIES request failed with status ${response.status}`);
+  if (!normalized.countryCode || !normalized.vatNumber) {
+    throw new Error("Paese e partita IVA sono obbligatori.");
   }
 
-  return await response.json();
+  console.log("[Invoice Request] VIES SOAP request", {
+    countryCode: normalized.countryCode,
+    vatNumber: normalized.vatNumber,
+  });
+
+  const client = await soap.createClientAsync(VIES_WSDL);
+  const [result] = await client.checkVatAsync({
+    countryCode: normalized.countryCode,
+    vatNumber: normalized.vatNumber,
+  });
+
+  const response = {
+    valid: Boolean(result?.valid),
+    countryCode: normalized.countryCode,
+    vatNumber: normalized.vatNumber,
+    fullVatNumber: `${normalized.countryCode}${normalized.vatNumber}`,
+    requestDate: result?.requestDate || "",
+    name: result?.name || "",
+    address: result?.address || "",
+    raw: result || null,
+  };
+
+  console.log("[Invoice Request] VIES SOAP response", response);
+
+  return response;
+}
+
+async function graphQL(admin, query, variables = {}) {
+  const response = await admin.graphql(query, { variables });
+  return response.json();
 }
 
 async function setCustomerMetafields(admin, customerGid, fields) {
@@ -115,8 +126,7 @@ async function setCustomerMetafields(admin, customerGid, fields) {
     }
   `;
 
-  const response = await admin.graphql(mutation, { variables: { metafields } });
-  const data = await response.json();
+  const data = await graphQL(admin, mutation, { metafields });
   const errors = data?.data?.metafieldsSet?.userErrors || [];
 
   if (errors.length) {
@@ -124,37 +134,68 @@ async function setCustomerMetafields(admin, customerGid, fields) {
   }
 }
 
-/**
- * Keep the original reverse-charge mutation for now.
- * We return true only if Shopify mutation does not return userErrors.
- */
 async function applyReverseCharge(admin, customerGid) {
-  if (!customerGid) return false;
+  if (!customerGid) {
+    return {
+      applied: false,
+      customerTaxExempt: false,
+      customerTaxExemptions: [],
+      error: "Missing customer ID",
+    };
+  }
 
   const mutation = `#graphql
-    mutation AddEuReverseCharge($customerId: ID!, $taxExemptions: [TaxExemption!]!) {
-      customerAddTaxExemptions(customerId: $customerId, taxExemptions: $taxExemptions) {
-        customer { id taxExempt taxExemptions }
+    mutation ApplyInvoiceReverseCharge($input: CustomerInput!) {
+      customerUpdate(input: $input) {
+        customer {
+          id
+          taxExempt
+          taxExemptions
+        }
         userErrors { field message }
       }
     }
   `;
 
-  const response = await admin.graphql(mutation, {
-    variables: {
-      customerId: customerGid,
-      taxExemptions: ["EU_REVERSE_CHARGE_EXEMPTION_RULE"],
+  const data = await graphQL(admin, mutation, {
+    input: {
+      id: customerGid,
+      taxExempt: true,
+      taxExemptions: [EU_REVERSE_CHARGE_EXEMPTION],
     },
   });
 
-  const data = await response.json();
-  const errors = data?.data?.customerAddTaxExemptions?.userErrors || [];
+  const errors = data?.data?.customerUpdate?.userErrors || [];
 
   if (errors.length) {
-    throw new Error(errors.map((error) => error.message).join(" | "));
+    const message = errors.map((error) => error.message).join(" | ");
+    console.error("[Invoice Request] customerUpdate tax exemption failed", {
+      customerGid,
+      errors,
+    });
+    throw new Error(message);
   }
 
-  return true;
+  const customer = data?.data?.customerUpdate?.customer;
+  const customerTaxExempt = Boolean(customer?.taxExempt);
+  const customerTaxExemptions = customer?.taxExemptions || [];
+  const applied =
+    customerTaxExempt === true &&
+    customerTaxExemptions.includes(EU_REVERSE_CHARGE_EXEMPTION);
+
+  console.log("[Invoice Request] customer tax exemption result", {
+    customerGid,
+    customerTaxExempt,
+    customerTaxExemptions,
+    applied,
+  });
+
+  return {
+    applied,
+    customerTaxExempt,
+    customerTaxExemptions,
+    error: applied ? "" : "Reverse charge exemption was not confirmed on the customer.",
+  };
 }
 
 async function createOrUpdateInvoiceRequest({ shop, cartToken, data }) {
@@ -169,14 +210,14 @@ async function createOrUpdateInvoiceRequest({ shop, cartToken, data }) {
     });
 
     if (existing) {
-      return await prisma.invoiceRequest.update({
+      return prisma.invoiceRequest.update({
         where: { id: existing.id },
         data,
       });
     }
   }
 
-  return await prisma.invoiceRequest.create({
+  return prisma.invoiceRequest.create({
     data: {
       shop,
       ...data,
@@ -198,18 +239,17 @@ export async function action({ request }) {
     return responseJson({ ok: false, error: "App proxy unavailable" }, 401);
   }
 
+  const url = new URL(request.url);
+  const proxyCustomerId = clean(url.searchParams.get("logged_in_customer_id"));
   const body = await readJson(request);
 
   const invoiceType = clean(body.invoiceType);
   const cartToken = clean(body.cartToken);
   const checkoutToken = clean(body.checkoutToken);
-
-  const proxyCustomerId = getProxyCustomerId(request);
-  const bodyCustomerId = clean(body.customerId);
-  const customerId = bodyCustomerId || proxyCustomerId;
+  const customerId = clean(body.customerId) || proxyCustomerId;
   const customerGid = toCustomerGid(customerId);
-
   const customerEmail = cleanEmailLike(body.customerEmail);
+
   const fiscalCode = cleanUpper(body.fiscalCode);
   const pec = cleanEmailLike(body.pec);
   const sdi = cleanUpper(body.sdi);
@@ -220,7 +260,7 @@ export async function action({ request }) {
   const normalized = normalizeVat(body.countryCode, body.vatNumber);
   const countryCode = normalized.countryCode;
   const vatNumber = normalized.vatNumber;
-  const fullVatNumber = fullVat(countryCode, vatNumber);
+  const fullVatNumber = vatNumber ? `${countryCode}${vatNumber}` : "";
 
   if (!["private", "company"].includes(invoiceType)) {
     return responseJson({ ok: false, error: "Tipo fattura non valido." }, 400);
@@ -270,7 +310,7 @@ export async function action({ request }) {
             lastName,
             viesChecked,
             viesValid,
-            viesRawResponse: viesRawResponse ? JSON.stringify(viesRawResponse) : null,
+            viesRawResponse: JSON.stringify(viesRawResponse),
             reverseCharge: false,
             taxExemptApplied: false,
             status: "failed",
@@ -278,22 +318,25 @@ export async function action({ request }) {
           },
         });
 
-        return responseJson({
-          ok: false,
-          invoiceRequestId: invoiceRequest.id,
-          error: `Partita IVA non valida su VIES (${fullVatNumber}). Reverse charge non applicato.`,
-          invoiceType,
-          vatNumber: fullVatNumber,
-          viesChecked,
-          viesValid,
-          reverseCharge: false,
-          taxExemptApplied: false,
-          requiresLoginForTaxExemption: false,
-        }, 400);
+        return responseJson(
+          {
+            ok: false,
+            invoiceRequestId: invoiceRequest.id,
+            invoiceType,
+            vatNumber: fullVatNumber,
+            viesChecked,
+            viesValid,
+            reverseCharge: false,
+            taxExemptApplied: false,
+            error: `Partita IVA non valida su VIES (${fullVatNumber}). Reverse charge non applicato.`,
+          },
+          400,
+        );
       }
 
       if (reverseCharge && customerGid) {
-        taxExemptApplied = await applyReverseCharge(admin, customerGid);
+        const taxExemptResult = await applyReverseCharge(admin, customerGid);
+        taxExemptApplied = Boolean(taxExemptResult.applied);
       } else if (reverseCharge && !customerGid) {
         requiresLoginForTaxExemption = true;
       }
@@ -337,7 +380,7 @@ export async function action({ request }) {
         reverseCharge,
         taxExemptApplied,
         status: invoiceType === "private" ? "registered" : "validated",
-        errorMessage: null,
+        errorMessage: taxExemptApplied || !reverseCharge ? null : "VIES valido, ma reverse charge non confermato sul cliente Shopify.",
       },
     });
 
@@ -353,6 +396,20 @@ export async function action({ request }) {
       requiresLoginForTaxExemption,
     });
   } catch (error) {
+    console.error("[Invoice Request] validate failed", {
+      message: error?.message,
+      invoiceType,
+      countryCode,
+      vatNumber: fullVatNumber,
+      customerId: customerGid || customerId,
+      proxyCustomerId,
+      reverseCharge,
+      taxExemptApplied,
+      viesChecked,
+      viesValid,
+      viesRawResponse,
+    });
+
     const invoiceRequest = await createOrUpdateInvoiceRequest({
       shop: session.shop,
       cartToken,
@@ -380,10 +437,13 @@ export async function action({ request }) {
       },
     });
 
-    return responseJson({
-      ok: false,
-      invoiceRequestId: invoiceRequest.id,
-      error: error?.message || "Errore validazione fattura.",
-    }, 500);
+    return responseJson(
+      {
+        ok: false,
+        invoiceRequestId: invoiceRequest.id,
+        error: error?.message || "Errore validazione fattura.",
+      },
+      500,
+    );
   }
 }
