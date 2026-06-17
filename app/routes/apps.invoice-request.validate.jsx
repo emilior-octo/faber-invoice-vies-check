@@ -70,21 +70,62 @@ async function readJson(request) {
   return Object.fromEntries(formData.entries());
 }
 
+function makeHandledError(message, status = 500, details = {}) {
+  const error = new Error(message);
+  error.status = status;
+  error.details = details;
+  return error;
+}
+
 async function checkVies(countryCode, vatNumber) {
+  // Defensive normalization directly before the VIES request.
+  // VIES wants countryCode separated from vatNumber, so DE118860726 must become:
+  // { countryCode: "DE", vatNumber: "118860726" }
+  const normalized = normalizeVat(countryCode, vatNumber);
+  const payload = {
+    countryCode: normalized.countryCode,
+    vatNumber: normalized.vatNumber,
+  };
+
+  console.info("[Invoice Request] VIES request payload", payload);
+
   const response = await fetch("https://ec.europa.eu/taxation_customs/vies/rest-api/check-vat-number", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Accept: "application/json",
     },
-    body: JSON.stringify({ countryCode, vatNumber }),
+    body: JSON.stringify(payload),
+  });
+
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (jsonError) {
+    console.error("[Invoice Request] VIES response JSON parse failed", {
+      status: response.status,
+      message: jsonError?.message,
+    });
+  }
+
+  console.info("[Invoice Request] VIES response", {
+    status: response.status,
+    ok: response.ok,
+    payload,
+    data,
   });
 
   if (!response.ok) {
-    throw new Error(`VIES request failed with status ${response.status}`);
+    throw makeHandledError(`VIES request failed with status ${response.status}`, 502, {
+      viesPayload: payload,
+      viesResponse: data,
+    });
   }
 
-  return await response.json();
+  return {
+    ...(data || {}),
+    _requestPayload: payload,
+  };
 }
 
 async function setCustomerMetafields(admin, customerGid, fields) {
@@ -368,11 +409,15 @@ export async function action({ request }) {
   }
 
   const body = await readJson(request);
+  const url = new URL(request.url);
+  const proxyCustomerId = clean(url.searchParams.get("logged_in_customer_id"));
 
   const invoiceType = clean(body.invoiceType);
   const cartToken = clean(body.cartToken);
   const checkoutToken = clean(body.checkoutToken);
-  const customerId = clean(body.customerId);
+  // App Proxy passes the logged-in customer id in the query string, not always in the POST body.
+  // Use it as fallback so reverse-charge can be applied to the real Shopify customer.
+  const customerId = clean(body.customerId) || proxyCustomerId;
   const originalCustomerGid = toCustomerGid(customerId);
   const customerEmail = cleanEmailLike(body.customerEmail);
 
@@ -421,8 +466,20 @@ export async function action({ request }) {
       viesValid = Boolean(viesRawResponse?.valid);
       reverseCharge = viesValid === true;
 
+      console.info("[Invoice Request] VIES result", {
+        inputCountryCode: countryCode,
+        inputVatNumber: vatNumber,
+        fullVatNumber,
+        viesPayload: viesRawResponse?._requestPayload || null,
+        valid: viesValid,
+        response: viesRawResponse,
+      });
+
       if (!viesValid) {
-        throw new Error("Partita IVA non valida su VIES.");
+        throw makeHandledError(`Partita IVA non valida su VIES (${fullVatNumber}).`, 400, {
+          viesPayload: viesRawResponse?._requestPayload || null,
+          viesResponse: viesRawResponse,
+        });
       }
 
       if (reverseCharge) {
@@ -521,7 +578,10 @@ export async function action({ request }) {
       countryCode,
       vatNumber: fullVatNumber,
       customerId: customerGid || customerId,
+      proxyCustomerId,
+      originalCustomerGid,
       customerEmail,
+      viesRawResponse,
       reverseCharge,
       taxExemptApplied,
       viesChecked,
@@ -555,13 +615,16 @@ export async function action({ request }) {
       },
     });
 
+    const responseStatus = Number(error?.status || 500);
+
     return responseJson({
       ok: false,
       invoiceRequestId: invoiceRequest.id,
       error: error?.message || "Errore validazione fattura.",
+      errorDetails: error?.details || null,
       reverseCharge,
       taxExemptApplied,
       requiresLoginForTaxExemption,
-    }, 500);
+    }, responseStatus >= 400 && responseStatus < 600 ? responseStatus : 500);
   }
 }
