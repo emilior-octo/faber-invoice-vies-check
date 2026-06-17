@@ -40,11 +40,64 @@ function normalizeVat(countryCode, vatNumber) {
     vat = vat.slice(country.length);
   }
 
+  if (country === "AT" && /^\d{8}$/.test(vat)) {
+    vat = `U${vat}`;
+  }
+
   return { countryCode: country, vatNumber: vat };
 }
 
 function normalizeFullVat(value) {
   return cleanUpper(value).replace(/[\s.\-_/]/g, "");
+}
+
+function classifyViesSoapError(error) {
+  const message = String(error?.message || error || "");
+  const raw = JSON.stringify(error || {});
+  const combined = `${message} ${raw}`.toUpperCase();
+
+  if (combined.includes("MS_UNAVAILABLE")) return "MS_UNAVAILABLE";
+  if (combined.includes("SERVICE_UNAVAILABLE")) return "SERVICE_UNAVAILABLE";
+  if (combined.includes("TIMEOUT") || combined.includes("ETIMEDOUT")) return "TIMEOUT";
+  if (combined.includes("INVALID_INPUT")) return "INVALID_INPUT";
+
+  return "VIES_TECHNICAL_ERROR";
+}
+
+function localeFrom(value) {
+  return clean(value).toLowerCase().startsWith("it") ? "it" : "en";
+}
+
+function messages(locale) {
+  const isIt = localeFrom(locale) === "it";
+
+  return {
+    invalidType: isIt ? "Tipo fattura non valido." : "Invalid invoice type.",
+    requiredVat: isIt
+      ? "Paese e partita IVA sono obbligatori."
+      : "Country and VAT number are required.",
+    viesUnavailable: (countryCode, fullVatNumber) =>
+      isIt
+        ? `La verifica VIES per questa partita IVA non è al momento disponibile (${countryCode} ${fullVatNumber}). Reverse charge non applicato. Riprova più tardi o contattaci per una verifica manuale.`
+        : `VIES validation for this VAT number is currently unavailable (${countryCode} ${fullVatNumber}). Reverse charge has not been applied. Please try again later or contact us for a manual check.`,
+    invalidVat: (fullVatNumber) =>
+      isIt
+        ? `Partita IVA non valida su VIES (${fullVatNumber}). Reverse charge non applicato.`
+        : `VAT number is not valid in VIES (${fullVatNumber}). Reverse charge has not been applied.`,
+    reverseChargeSaved: isIt
+      ? "Reverse charge validato. La richiesta fattura è stata salvata."
+      : "Reverse charge validated. Your invoice request has been saved.",
+    taxExemptPrepared: isIt
+      ? "Reverse charge validato e profilo cliente preparato per esenzione IVA. Usa la stessa email al checkout."
+      : "Reverse charge validated and customer profile prepared for VAT exemption. Use the same email at checkout.",
+    loggedTaxExemptApplied: isIt
+      ? "Reverse charge validato e profilo cliente aggiornato per esenzione IVA."
+      : "Reverse charge validated and customer profile updated for VAT exemption.",
+  };
+}
+
+function viesUnavailableMessage(countryCode, fullVatNumber, locale = "it") {
+  return messages(locale).viesUnavailable(countryCode, fullVatNumber);
 }
 
 function toCustomerGid(customerId) {
@@ -76,26 +129,45 @@ async function checkVies(countryCode, vatNumber) {
     vatNumber: normalized.vatNumber,
   });
 
-  const client = await soap.createClientAsync(VIES_WSDL);
-  const [result] = await client.checkVatAsync({
-    countryCode: normalized.countryCode,
-    vatNumber: normalized.vatNumber,
-  });
+  try {
+    const client = await soap.createClientAsync(VIES_WSDL);
+    const [result] = await client.checkVatAsync({
+      countryCode: normalized.countryCode,
+      vatNumber: normalized.vatNumber,
+    });
 
-  const response = {
-    valid: Boolean(result?.valid),
-    countryCode: normalized.countryCode,
-    vatNumber: normalized.vatNumber,
-    fullVatNumber: `${normalized.countryCode}${normalized.vatNumber}`,
-    requestDate: result?.requestDate || "",
-    name: result?.name || "",
-    address: result?.address || "",
-    raw: result || null,
-  };
+    const response = {
+      valid: result?.valid === true || String(result?.valid).toLowerCase() === "true",
+      unavailable: false,
+      countryCode: normalized.countryCode,
+      vatNumber: normalized.vatNumber,
+      fullVatNumber: `${normalized.countryCode}${normalized.vatNumber}`,
+      requestDate: result?.requestDate || "",
+      name: result?.name || "",
+      address: result?.address || "",
+      raw: result || null,
+    };
 
-  console.log("[Invoice Request] VIES SOAP response", response);
+    console.log("[Invoice Request] VIES SOAP response", response);
 
-  return response;
+    return response;
+  } catch (error) {
+    const errorCode = classifyViesSoapError(error);
+    const response = {
+      valid: null,
+      unavailable: true,
+      errorCode,
+      errorMessage: error?.message || String(error || ""),
+      countryCode: normalized.countryCode,
+      vatNumber: normalized.vatNumber,
+      fullVatNumber: `${normalized.countryCode}${normalized.vatNumber}`,
+      raw: null,
+    };
+
+    console.error("[Invoice Request] VIES SOAP unavailable", response);
+
+    return response;
+  }
 }
 
 async function graphQL(admin, query, variables = {}) {
@@ -132,6 +204,93 @@ async function setCustomerMetafields(admin, customerGid, fields) {
   if (errors.length) {
     throw new Error(errors.map((error) => error.message).join(" | "));
   }
+}
+
+
+async function findCustomerByEmail(admin, email) {
+  const cleanEmail = cleanEmailLike(email);
+  if (!cleanEmail) return null;
+
+  const query = `#graphql
+    query FindInvoiceCustomerByEmail($query: String!) {
+      customers(first: 1, query: $query) {
+        nodes {
+          id
+          email
+          taxExempt
+          taxExemptions
+        }
+      }
+    }
+  `;
+
+  const data = await graphQL(admin, query, { query: `email:${cleanEmail}` });
+  const customer = data?.data?.customers?.nodes?.[0] || null;
+
+  console.log("[Invoice Request] customer lookup by email", {
+    email: cleanEmail,
+    found: Boolean(customer?.id),
+    customerId: customer?.id || "",
+    taxExempt: customer?.taxExempt ?? null,
+    taxExemptions: customer?.taxExemptions || [],
+  });
+
+  return customer;
+}
+
+async function createCustomerForInvoice(admin, email, companyName) {
+  const cleanEmail = cleanEmailLike(email);
+  if (!cleanEmail) return null;
+
+  const mutation = `#graphql
+    mutation CreateInvoiceCustomer($input: CustomerInput!) {
+      customerCreate(input: $input) {
+        customer {
+          id
+          email
+          taxExempt
+          taxExemptions
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const data = await graphQL(admin, mutation, {
+    input: {
+      email: cleanEmail,
+      firstName: "Invoice",
+      lastName: "Customer",
+      note: companyName
+        ? `Invoice request reverse charge - ${companyName}`
+        : "Invoice request reverse charge",
+    },
+  });
+
+  const errors = data?.data?.customerCreate?.userErrors || [];
+  if (errors.length) {
+    const message = errors.map((error) => error.message).join(" | ");
+    console.error("[Invoice Request] customerCreate failed", {
+      email: cleanEmail,
+      errors,
+    });
+    throw new Error(message);
+  }
+
+  const customer = data?.data?.customerCreate?.customer || null;
+
+  console.log("[Invoice Request] customer created for invoice", {
+    email: cleanEmail,
+    customerId: customer?.id || "",
+  });
+
+  return customer;
+}
+
+async function findOrCreateCustomerByEmail(admin, email, companyName) {
+  const existing = await findCustomerByEmail(admin, email);
+  if (existing?.id) return existing;
+  return createCustomerForInvoice(admin, email, companyName);
 }
 
 async function applyReverseCharge(admin, customerGid) {
@@ -242,6 +401,8 @@ export async function action({ request }) {
   const url = new URL(request.url);
   const proxyCustomerId = clean(url.searchParams.get("logged_in_customer_id"));
   const body = await readJson(request);
+  const locale = localeFrom(body.locale);
+  const i18n = messages(locale);
 
   const invoiceType = clean(body.invoiceType);
   const cartToken = clean(body.cartToken);
@@ -263,11 +424,11 @@ export async function action({ request }) {
   const fullVatNumber = vatNumber ? `${countryCode}${vatNumber}` : "";
 
   if (!["private", "company"].includes(invoiceType)) {
-    return responseJson({ ok: false, error: "Tipo fattura non valido." }, 400);
+    return responseJson({ ok: false, error: i18n.invalidType }, 400);
   }
 
   if (invoiceType === "company" && (!countryCode || !vatNumber)) {
-    return responseJson({ ok: false, error: "Paese e partita IVA sono obbligatori." }, 400);
+    return responseJson({ ok: false, error: i18n.requiredVat }, 400);
   }
 
   let viesChecked = false;
@@ -275,7 +436,10 @@ export async function action({ request }) {
   let viesRawResponse = null;
   let reverseCharge = false;
   let taxExemptApplied = false;
+  let taxExemptCustomerPrepared = false;
+  let mustUseSameEmailAtCheckout = false;
   let requiresLoginForTaxExemption = false;
+  let preparedCustomerGid = customerGid;
 
   try {
     const shouldCheckVies =
@@ -287,17 +451,18 @@ export async function action({ request }) {
     if (shouldCheckVies) {
       viesChecked = true;
       viesRawResponse = await checkVies(countryCode, vatNumber);
-      viesValid = Boolean(viesRawResponse?.valid);
+      viesValid = viesRawResponse?.valid === true ? true : viesRawResponse?.valid === false ? false : null;
       reverseCharge = viesValid === true;
 
-      if (!viesValid) {
+      if (viesRawResponse?.unavailable) {
+        const errorMessage = viesUnavailableMessage(countryCode, fullVatNumber, locale);
         const invoiceRequest = await createOrUpdateInvoiceRequest({
           shop: session.shop,
           cartToken,
           data: {
             cartToken,
             checkoutToken,
-            customerId: customerGid || customerId,
+            customerId: preparedCustomerGid || customerGid || customerId,
             customerEmail,
             invoiceType,
             countryCode,
@@ -309,12 +474,12 @@ export async function action({ request }) {
             firstName,
             lastName,
             viesChecked,
-            viesValid,
+            viesValid: null,
             viesRawResponse: JSON.stringify(viesRawResponse),
             reverseCharge: false,
             taxExemptApplied: false,
             status: "failed",
-            errorMessage: `Partita IVA non valida su VIES (${fullVatNumber}). Reverse charge non applicato.`,
+            errorMessage,
           },
         });
 
@@ -325,10 +490,57 @@ export async function action({ request }) {
             invoiceType,
             vatNumber: fullVatNumber,
             viesChecked,
-            viesValid,
+            viesValid: null,
             reverseCharge: false,
             taxExemptApplied: false,
-            error: `Partita IVA non valida su VIES (${fullVatNumber}). Reverse charge non applicato.`,
+            viesUnavailable: true,
+            viesErrorCode: viesRawResponse.errorCode || "VIES_UNAVAILABLE",
+            error: errorMessage,
+          },
+          400,
+        );
+      }
+
+      if (viesValid !== true) {
+        const errorMessage = i18n.invalidVat(fullVatNumber);
+        const invoiceRequest = await createOrUpdateInvoiceRequest({
+          shop: session.shop,
+          cartToken,
+          data: {
+            cartToken,
+            checkoutToken,
+            customerId: preparedCustomerGid || customerGid || customerId,
+            customerEmail,
+            invoiceType,
+            countryCode,
+            fiscalCode,
+            vatNumber: fullVatNumber,
+            pec,
+            sdi,
+            companyName,
+            firstName,
+            lastName,
+            viesChecked,
+            viesValid: false,
+            viesRawResponse: JSON.stringify(viesRawResponse),
+            reverseCharge: false,
+            taxExemptApplied: false,
+            status: "failed",
+            errorMessage,
+          },
+        });
+
+        return responseJson(
+          {
+            ok: false,
+            invoiceRequestId: invoiceRequest.id,
+            invoiceType,
+            vatNumber: fullVatNumber,
+            viesChecked,
+            viesValid: false,
+            reverseCharge: false,
+            taxExemptApplied: false,
+            error: errorMessage,
           },
           400,
         );
@@ -337,13 +549,25 @@ export async function action({ request }) {
       if (reverseCharge && customerGid) {
         const taxExemptResult = await applyReverseCharge(admin, customerGid);
         taxExemptApplied = Boolean(taxExemptResult.applied);
+        taxExemptCustomerPrepared = taxExemptApplied;
+        preparedCustomerGid = customerGid;
+      } else if (reverseCharge && customerEmail) {
+        const customerByEmail = await findOrCreateCustomerByEmail(admin, customerEmail, companyName);
+        preparedCustomerGid = customerByEmail?.id || "";
+
+        if (preparedCustomerGid) {
+          const taxExemptResult = await applyReverseCharge(admin, preparedCustomerGid);
+          taxExemptCustomerPrepared = Boolean(taxExemptResult.applied);
+          taxExemptApplied = false;
+          mustUseSameEmailAtCheckout = taxExemptCustomerPrepared;
+        }
       } else if (reverseCharge && !customerGid) {
         requiresLoginForTaxExemption = true;
       }
     }
 
-    if (customerGid) {
-      await setCustomerMetafields(admin, customerGid, {
+    if (preparedCustomerGid) {
+      await setCustomerMetafields(admin, preparedCustomerGid, {
         invoice_type: invoiceType,
         fiscal_code: fiscalCode,
         vat_number: fullVatNumber,
@@ -363,7 +587,7 @@ export async function action({ request }) {
       data: {
         cartToken,
         checkoutToken,
-        customerId: customerGid || customerId,
+        customerId: preparedCustomerGid || customerGid || customerId,
         customerEmail,
         invoiceType,
         countryCode,
@@ -380,7 +604,7 @@ export async function action({ request }) {
         reverseCharge,
         taxExemptApplied,
         status: invoiceType === "private" ? "registered" : "validated",
-        errorMessage: taxExemptApplied || !reverseCharge ? null : "VIES valido, ma reverse charge non confermato sul cliente Shopify.",
+        errorMessage: taxExemptApplied || taxExemptCustomerPrepared || !reverseCharge ? null : "VIES valido, ma reverse charge non confermato sul cliente Shopify.",
       },
     });
 
@@ -393,7 +617,18 @@ export async function action({ request }) {
       viesValid,
       reverseCharge,
       taxExemptApplied,
+      taxExemptCustomerPrepared,
+      mustUseSameEmailAtCheckout,
       requiresLoginForTaxExemption,
+      customerEmail,
+      customerId: preparedCustomerGid || customerGid || customerId || "",
+      message: reverseCharge
+        ? customerGid && taxExemptApplied
+          ? i18n.loggedTaxExemptApplied
+          : taxExemptCustomerPrepared
+            ? i18n.taxExemptPrepared
+            : i18n.reverseChargeSaved
+        : undefined,
     });
   } catch (error) {
     console.error("[Invoice Request] validate failed", {
@@ -401,7 +636,7 @@ export async function action({ request }) {
       invoiceType,
       countryCode,
       vatNumber: fullVatNumber,
-      customerId: customerGid || customerId,
+      customerId: preparedCustomerGid || customerGid || customerId,
       proxyCustomerId,
       reverseCharge,
       taxExemptApplied,
@@ -416,7 +651,7 @@ export async function action({ request }) {
       data: {
         cartToken,
         checkoutToken,
-        customerId: customerGid || customerId,
+        customerId: preparedCustomerGid || customerGid || customerId,
         customerEmail,
         invoiceType,
         countryCode,
