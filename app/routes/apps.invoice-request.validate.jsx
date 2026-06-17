@@ -10,7 +10,7 @@ const EU_COUNTRIES = new Set([
   "NL", "PL", "PT", "RO", "SE", "SI", "SK",
 ]);
 
-const EU_REVERSE_CHARGE_EXEMPTION = "EU_REVERSE_CHARGE_EXEMPTION_RULE";
+const EU_REVERSE_CHARGE = "EU_REVERSE_CHARGE_EXEMPTION_RULE";
 
 function responseJson(payload, status = 200) {
   return new Response(JSON.stringify(payload), {
@@ -46,6 +46,17 @@ function toCustomerGid(customerId) {
   const raw = clean(customerId);
   if (!raw) return "";
   return raw.startsWith("gid://") ? raw : `gid://shopify/Customer/${raw}`;
+}
+
+function escapeShopifySearch(value) {
+  return clean(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function graphQLErrors(data) {
+  const errors = data?.errors;
+  if (!errors) return [];
+  if (Array.isArray(errors)) return errors.map((error) => error?.message).filter(Boolean);
+  return [String(errors)];
 }
 
 async function readJson(request) {
@@ -101,42 +112,225 @@ async function setCustomerMetafields(admin, customerGid, fields) {
 
   const response = await admin.graphql(mutation, { variables: { metafields } });
   const data = await response.json();
+  const topLevelErrors = graphQLErrors(data);
   const errors = data?.data?.metafieldsSet?.userErrors || [];
 
-  if (errors.length) {
-    throw new Error(errors.map((error) => error.message).join(" | "));
+  if (topLevelErrors.length || errors.length) {
+    throw new Error([
+      ...topLevelErrors,
+      ...errors.map((error) => error.message),
+    ].join(" | "));
   }
 }
 
-async function readCustomerTaxState(admin, customerGid) {
-  if (!customerGid) {
+async function findCustomerByEmail(admin, email) {
+  const cleanedEmail = cleanEmailLike(email);
+  if (!cleanedEmail) return null;
+
+  const query = `#graphql
+    query FindCustomerByEmail($query: String!) {
+      customers(first: 1, query: $query) {
+        nodes {
+          id
+          email
+          taxExempt
+          taxExemptions
+        }
+      }
+    }
+  `;
+
+  const response = await admin.graphql(query, {
+    variables: { query: `email:${escapeShopifySearch(cleanedEmail)}` },
+  });
+
+  const data = await response.json();
+  const topLevelErrors = graphQLErrors(data);
+  if (topLevelErrors.length) {
+    throw new Error(topLevelErrors.join(" | "));
+  }
+
+  return data?.data?.customers?.nodes?.[0] || null;
+}
+
+async function createCustomerByEmail(admin, { email, firstName, lastName, companyName }) {
+  const cleanedEmail = cleanEmailLike(email);
+  if (!cleanedEmail) return null;
+
+  const mutation = `#graphql
+    mutation CreateInvoiceCustomer($input: CustomerInput!) {
+      customerCreate(input: $input) {
+        customer {
+          id
+          email
+          taxExempt
+          taxExemptions
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const input = {
+    email: cleanedEmail,
+    firstName: clean(firstName) || undefined,
+    lastName: clean(lastName) || undefined,
+    note: clean(companyName)
+      ? `Created by Invoice Request / VIES Check for ${clean(companyName)}`
+      : "Created by Invoice Request / VIES Check",
+  };
+
+  const response = await admin.graphql(mutation, { variables: { input } });
+  const data = await response.json();
+  const topLevelErrors = graphQLErrors(data);
+  const userErrors = data?.data?.customerCreate?.userErrors || [];
+
+  if (topLevelErrors.length) {
+    throw new Error(topLevelErrors.join(" | "));
+  }
+
+  if (userErrors.length) {
+    const message = userErrors.map((error) => error.message).join(" | ");
+
+    // If Shopify says the email already exists, race/fallback to lookup.
+    if (/already|taken|exists/i.test(message)) {
+      const existing = await findCustomerByEmail(admin, cleanedEmail);
+      if (existing?.id) return existing;
+    }
+
+    throw new Error(message);
+  }
+
+  return data?.data?.customerCreate?.customer || null;
+}
+
+async function ensureCustomerForReverseCharge(admin, { customerGid, email, firstName, lastName, companyName }) {
+  if (customerGid) {
     return {
-      customerTaxExempt: false,
-      customerTaxExemptions: [],
+      id: customerGid,
+      email: cleanEmailLike(email),
+      created: false,
+      foundByEmail: false,
     };
   }
 
+  const cleanedEmail = cleanEmailLike(email);
+  if (!cleanedEmail) {
+    throw new Error("Per applicare il reverse charge automatico è obbligatoria l'email aziendale.");
+  }
+
+  const existing = await findCustomerByEmail(admin, cleanedEmail);
+  if (existing?.id) {
+    return {
+      ...existing,
+      created: false,
+      foundByEmail: true,
+    };
+  }
+
+  const created = await createCustomerByEmail(admin, {
+    email: cleanedEmail,
+    firstName,
+    lastName,
+    companyName,
+  });
+
+  if (!created?.id) {
+    throw new Error("Non sono riuscito a creare il cliente Shopify per applicare il reverse charge.");
+  }
+
+  return {
+    ...created,
+    created: true,
+    foundByEmail: true,
+  };
+}
+
+async function setCustomerTaxExemptFlag(admin, customerGid, taxExempt) {
+  const mutation = `#graphql
+    mutation SetCustomerTaxExempt($input: CustomerInput!) {
+      customerUpdate(input: $input) {
+        customer { id taxExempt taxExemptions }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const response = await admin.graphql(mutation, {
+    variables: {
+      input: {
+        id: customerGid,
+        taxExempt: Boolean(taxExempt),
+      },
+    },
+  });
+
+  const data = await response.json();
+  const topLevelErrors = graphQLErrors(data);
+  const userErrors = data?.data?.customerUpdate?.userErrors || [];
+
+  if (topLevelErrors.length || userErrors.length) {
+    throw new Error([
+      ...topLevelErrors,
+      ...userErrors.map((error) => error.message),
+    ].join(" | "));
+  }
+
+  return data?.data?.customerUpdate?.customer || null;
+}
+
+async function addReverseChargeExemption(admin, customerGid) {
+  const mutation = `#graphql
+    mutation AddEuReverseCharge($customerId: ID!, $taxExemptions: [TaxExemption!]!) {
+      customerAddTaxExemptions(customerId: $customerId, taxExemptions: $taxExemptions) {
+        customer { id taxExempt taxExemptions }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const response = await admin.graphql(mutation, {
+    variables: {
+      customerId: customerGid,
+      taxExemptions: [EU_REVERSE_CHARGE],
+    },
+  });
+
+  const data = await response.json();
+  const topLevelErrors = graphQLErrors(data);
+  const userErrors = data?.data?.customerAddTaxExemptions?.userErrors || [];
+
+  if (topLevelErrors.length || userErrors.length) {
+    throw new Error([
+      ...topLevelErrors,
+      ...userErrors.map((error) => error.message),
+    ].join(" | "));
+  }
+
+  return data?.data?.customerAddTaxExemptions?.customer || null;
+}
+
+async function getCustomerTaxDetails(admin, customerGid) {
   const query = `#graphql
-    query ReadCustomerTaxState($id: ID!) {
+    query GetCustomerTaxDetails($id: ID!) {
       customer(id: $id) {
         id
+        email
         taxExempt
         taxExemptions
       }
     }
   `;
 
-  const response = await admin.graphql(query, {
-    variables: { id: customerGid },
-  });
-
+  const response = await admin.graphql(query, { variables: { id: customerGid } });
   const data = await response.json();
-  const customer = data?.data?.customer;
+  const topLevelErrors = graphQLErrors(data);
 
-  return {
-    customerTaxExempt: Boolean(customer?.taxExempt),
-    customerTaxExemptions: customer?.taxExemptions || [],
-  };
+  if (topLevelErrors.length) {
+    throw new Error(topLevelErrors.join(" | "));
+  }
+
+  return data?.data?.customer || null;
 }
 
 async function applyReverseCharge(admin, customerGid) {
@@ -149,57 +343,24 @@ async function applyReverseCharge(admin, customerGid) {
     };
   }
 
-  const mutation = `#graphql
-    mutation ApplyEuReverseCharge($input: CustomerInput!) {
-      customerUpdate(input: $input) {
-        customer {
-          id
-          taxExempt
-          taxExemptions
-        }
-        userErrors {
-          field
-          message
-        }
-      }
-    }
-  `;
+  // Shopify checkout only respects reverse charge if the customer is tax exempt.
+  // We therefore set the taxExempt flag and also attach the EU reverse charge exemption.
+  await setCustomerTaxExemptFlag(admin, customerGid, true);
+  await addReverseChargeExemption(admin, customerGid);
 
-  const response = await admin.graphql(mutation, {
-    variables: {
-      input: {
-        id: customerGid,
-        taxExempt: true,
-        taxExemptions: [EU_REVERSE_CHARGE_EXEMPTION],
-      },
-    },
-  });
-
-  const data = await response.json();
-  const errors = data?.data?.customerUpdate?.userErrors || [];
-
-  if (errors.length) {
-    throw new Error(errors.map((error) => error.message).join(" | "));
-  }
-
-  const customerFromMutation = data?.data?.customerUpdate?.customer;
-  let customerTaxExempt = Boolean(customerFromMutation?.taxExempt);
-  let customerTaxExemptions = customerFromMutation?.taxExemptions || [];
-
-  // Re-read after update: this avoids trusting only the mutation payload and gives us
-  // the real customer tax state before the customer is sent to checkout.
-  const confirmed = await readCustomerTaxState(admin, customerGid);
-  customerTaxExempt = confirmed.customerTaxExempt;
-  customerTaxExemptions = confirmed.customerTaxExemptions;
+  const customer = await getCustomerTaxDetails(admin, customerGid);
+  const taxExemptions = customer?.taxExemptions || [];
+  const customerTaxExempt = Boolean(customer?.taxExempt);
 
   const applied =
     customerTaxExempt === true &&
-    customerTaxExemptions.includes(EU_REVERSE_CHARGE_EXEMPTION);
+    taxExemptions.includes(EU_REVERSE_CHARGE);
 
   return {
     applied,
     customerTaxExempt,
-    customerTaxExemptions,
+    customerTaxExemptions: taxExemptions,
+    customerEmail: customer?.email || "",
     error: applied ? "" : "EU reverse charge exemption was not confirmed on customer.",
   };
 }
@@ -251,7 +412,7 @@ export async function action({ request }) {
   const cartToken = clean(body.cartToken);
   const checkoutToken = clean(body.checkoutToken);
   const customerId = clean(body.customerId);
-  const customerGid = toCustomerGid(customerId);
+  const originalCustomerGid = toCustomerGid(customerId);
   const customerEmail = cleanEmailLike(body.customerEmail);
 
   const fiscalCode = cleanUpper(body.fiscalCode);
@@ -274,11 +435,14 @@ export async function action({ request }) {
     return responseJson({ ok: false, error: "Paese e partita IVA sono obbligatori." }, 400);
   }
 
+  let customerGid = originalCustomerGid;
+  let preparedCustomer = null;
   let viesChecked = false;
   let viesValid = null;
   let viesRawResponse = null;
   let reverseCharge = false;
   let taxExemptApplied = false;
+  let taxExemptCustomerPrepared = false;
   let requiresLoginForTaxExemption = false;
   let customerTaxExempt = false;
   let customerTaxExemptions = [];
@@ -300,9 +464,20 @@ export async function action({ request }) {
         throw new Error("Partita IVA non valida su VIES.");
       }
 
-      if (reverseCharge && customerGid) {
+      if (reverseCharge) {
+        preparedCustomer = await ensureCustomerForReverseCharge(admin, {
+          customerGid,
+          email: customerEmail,
+          firstName,
+          lastName,
+          companyName,
+        });
+
+        customerGid = preparedCustomer?.id || customerGid;
+
         const taxExemptResult = await applyReverseCharge(admin, customerGid);
         taxExemptApplied = Boolean(taxExemptResult.applied);
+        taxExemptCustomerPrepared = taxExemptApplied;
         customerTaxExempt = Boolean(taxExemptResult.customerTaxExempt);
         customerTaxExemptions = taxExemptResult.customerTaxExemptions || [];
 
@@ -312,8 +487,6 @@ export async function action({ request }) {
               "VAT number is valid, but VAT exemption could not be applied to the customer."
           );
         }
-      } else if (reverseCharge && !customerGid) {
-        requiresLoginForTaxExemption = true;
       }
     }
 
@@ -330,8 +503,6 @@ export async function action({ request }) {
         vies_valid: viesValid === null ? "" : String(viesValid),
         reverse_charge: String(reverseCharge),
         tax_exempt_applied: String(taxExemptApplied),
-        customer_tax_exempt: String(customerTaxExempt),
-        customer_tax_exemptions: customerTaxExemptions.join(","),
       });
     }
 
@@ -367,13 +538,19 @@ export async function action({ request }) {
       invoiceRequestId: invoiceRequest.id,
       invoiceType,
       vatNumber: fullVatNumber,
+      customerEmail,
+      customerId: customerGid || customerId,
+      customerCreated: Boolean(preparedCustomer?.created),
+      customerFoundByEmail: Boolean(preparedCustomer?.foundByEmail),
       viesChecked,
       viesValid,
       reverseCharge,
       taxExemptApplied,
+      taxExemptCustomerPrepared,
       customerTaxExempt,
       customerTaxExemptions,
       requiresLoginForTaxExemption,
+      mustUseSameEmailAtCheckout: Boolean(reverseCharge && customerEmail),
     });
   } catch (error) {
     const invoiceRequest = await createOrUpdateInvoiceRequest({
@@ -407,14 +584,8 @@ export async function action({ request }) {
       ok: false,
       invoiceRequestId: invoiceRequest.id,
       error: error?.message || "Errore validazione fattura.",
-      invoiceType,
-      vatNumber: fullVatNumber,
-      viesChecked,
-      viesValid,
       reverseCharge,
       taxExemptApplied,
-      customerTaxExempt,
-      customerTaxExemptions,
       requiresLoginForTaxExemption,
     }, 500);
   }
