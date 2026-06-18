@@ -78,8 +78,8 @@ function messages(locale) {
       : "Country and VAT number are required.",
     viesUnavailable: (countryCode, fullVatNumber) =>
       isIt
-        ? `La verifica VIES per questa partita IVA non è al momento disponibile (${countryCode} ${fullVatNumber}). Reverse charge non applicato. Riprova più tardi o contattaci per una verifica manuale.`
-        : `VIES validation for this VAT number is currently unavailable (${countryCode} ${fullVatNumber}). Reverse charge has not been applied. Please try again later or contact us for a manual check.`,
+        ? `Verifica VIES non disponibile per questa partita IVA (${countryCode} ${fullVatNumber}). Reverse charge applicato con controllo manuale richiesto.`
+        : `VIES validation is unavailable for this VAT number (${countryCode} ${fullVatNumber}). Reverse charge has been applied with manual review required.`,
     invalidVat: (fullVatNumber) =>
       isIt
         ? `Partita IVA non valida su VIES (${fullVatNumber}). Reverse charge non applicato.`
@@ -434,6 +434,7 @@ export async function action({ request }) {
   let viesChecked = false;
   let viesValid = null;
   let viesRawResponse = null;
+  let viesUnavailable = false;
   let reverseCharge = false;
   let taxExemptApplied = false;
   let taxExemptCustomerPrepared = false;
@@ -455,53 +456,16 @@ export async function action({ request }) {
       reverseCharge = viesValid === true;
 
       if (viesRawResponse?.unavailable) {
-        const errorMessage = viesUnavailableMessage(countryCode, fullVatNumber, locale);
-        const invoiceRequest = await createOrUpdateInvoiceRequest({
-          shop: session.shop,
-          cartToken,
-          data: {
-            cartToken,
-            checkoutToken,
-            customerId: preparedCustomerGid || customerGid || customerId,
-            customerEmail,
-            invoiceType,
-            countryCode,
-            fiscalCode,
-            vatNumber: fullVatNumber,
-            pec,
-            sdi,
-            companyName,
-            firstName,
-            lastName,
-            viesChecked,
-            viesValid: null,
-            viesRawResponse: JSON.stringify(viesRawResponse),
-            reverseCharge: false,
-            taxExemptApplied: false,
-            status: "failed",
-            errorMessage,
-          },
-        });
-
-        return responseJson(
-          {
-            ok: false,
-            invoiceRequestId: invoiceRequest.id,
-            invoiceType,
-            vatNumber: fullVatNumber,
-            viesChecked,
-            viesValid: null,
-            reverseCharge: false,
-            taxExemptApplied: false,
-            viesUnavailable: true,
-            viesErrorCode: viesRawResponse.errorCode || "VIES_UNAVAILABLE",
-            error: errorMessage,
-          },
-          400,
-        );
+        // Business rule: do not block reverse charge for technical VIES failures
+        // (for example MS_UNAVAILABLE on a member-state database).
+        // We apply reverse charge, prepare the customer tax exemption if possible,
+        // and mark the request for manual review in the DB.
+        viesUnavailable = true;
+        viesValid = null;
+        reverseCharge = true;
       }
 
-      if (viesValid !== true) {
+      if (!viesUnavailable && viesValid !== true) {
         const errorMessage = i18n.invalidVat(fullVatNumber);
         const invoiceRequest = await createOrUpdateInvoiceRequest({
           shop: session.shop,
@@ -558,7 +522,7 @@ export async function action({ request }) {
         if (preparedCustomerGid) {
           const taxExemptResult = await applyReverseCharge(admin, preparedCustomerGid);
           taxExemptCustomerPrepared = Boolean(taxExemptResult.applied);
-          taxExemptApplied = false;
+          taxExemptApplied = Boolean(taxExemptResult.applied);
           mustUseSameEmailAtCheckout = taxExemptCustomerPrepared;
         }
       } else if (reverseCharge && !customerGid) {
@@ -603,8 +567,12 @@ export async function action({ request }) {
         viesRawResponse: viesRawResponse ? JSON.stringify(viesRawResponse) : null,
         reverseCharge,
         taxExemptApplied,
-        status: invoiceType === "private" ? "registered" : "validated",
-        errorMessage: taxExemptApplied || taxExemptCustomerPrepared || !reverseCharge ? null : "VIES valido, ma reverse charge non confermato sul cliente Shopify.",
+        status: viesUnavailable ? "pending_review" : invoiceType === "private" ? "registered" : "validated",
+        errorMessage: viesUnavailable
+          ? `ATTENZIONE: reverse charge applicato, ma verifica VIES non disponibile (${viesRawResponse?.errorCode || "VIES_UNAVAILABLE"}). Controllo manuale richiesto.`
+          : taxExemptApplied || taxExemptCustomerPrepared || !reverseCharge
+            ? null
+            : "VIES valido, ma reverse charge non confermato sul cliente Shopify.",
       },
     });
 
@@ -617,17 +585,22 @@ export async function action({ request }) {
       viesValid,
       reverseCharge,
       taxExemptApplied,
+      viesUnavailable,
       taxExemptCustomerPrepared,
+      reviewRequired: viesUnavailable,
+      viesErrorCode: viesRawResponse?.errorCode || "",
       mustUseSameEmailAtCheckout,
       requiresLoginForTaxExemption,
       customerEmail,
       customerId: preparedCustomerGid || customerGid || customerId || "",
       message: reverseCharge
-        ? customerGid && taxExemptApplied
-          ? i18n.loggedTaxExemptApplied
-          : taxExemptCustomerPrepared
-            ? i18n.taxExemptPrepared
-            : i18n.reverseChargeSaved
+        ? viesUnavailable
+          ? i18n.viesUnavailable(countryCode, fullVatNumber)
+          : customerGid && taxExemptApplied
+            ? i18n.loggedTaxExemptApplied
+            : taxExemptCustomerPrepared
+              ? i18n.taxExemptPrepared
+              : i18n.reverseChargeSaved
         : undefined,
     });
   } catch (error) {
@@ -640,6 +613,7 @@ export async function action({ request }) {
       proxyCustomerId,
       reverseCharge,
       taxExemptApplied,
+      viesUnavailable,
       viesChecked,
       viesValid,
       viesRawResponse,
