@@ -272,17 +272,62 @@ function formatBackfillOrderTotals(order = {}) {
   return lines.length ? `Order totals:\n${lines.join("\n")}` : "";
 }
 
+function normalizeLookupKey(value) {
+  return clean(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
 function pairValue(pairs, keys) {
-  const wanted = keys.map((key) => clean(key).toLowerCase());
+  const wanted = keys.map((key) => normalizeLookupKey(key)).filter(Boolean);
 
   for (const pair of pairs || []) {
-    const key = clean(pair?.key || pair?.name).toLowerCase();
+    const key = normalizeLookupKey(pair?.key || pair?.name);
     const value = clean(pair?.value);
     if (!key || !value) continue;
     if (wanted.some((item) => key === item || key.includes(item))) return value;
   }
 
   return "";
+}
+
+function getLocalizationExtensionValue(order, exactKeys) {
+  const wanted = new Set(exactKeys.map((key) => clean(key).toUpperCase()).filter(Boolean));
+  const nodes = order?.localizationExtensions?.nodes || [];
+
+  for (const field of nodes) {
+    const key = clean(field?.key).toUpperCase();
+    const value = clean(field?.value);
+    if (!key || !value) continue;
+    if (wanted.has(key)) return value;
+  }
+
+  return "";
+}
+
+function formatLocalizationExtensions(order = {}) {
+  const nodes = order?.localizationExtensions?.nodes || [];
+  const lines = nodes
+    .map((field) => {
+      const key = clean(field?.key);
+      const title = clean(field?.title);
+      const value = clean(field?.value);
+      if (!key || !value) return "";
+      return `- ${key}${title ? ` (${title})` : ""}: ${value}`;
+    })
+    .filter(Boolean);
+
+  return lines.length ? `Shopify localization fields:
+${lines.join("\n")}` : "";
+}
+
+function sameNormalizedValue(a, b) {
+  const left = clean(a).toLowerCase();
+  const right = clean(b).toLowerCase();
+  return Boolean(left && right && left === right);
 }
 
 function getOrderGid(value) {
@@ -300,6 +345,15 @@ async function fetchOrderForBackfill(admin, { orderId, orderName }) {
     note
     currencyCode
     customAttributes { key value }
+    localizationExtensions(first: 20) {
+      nodes {
+        countryCode
+        key
+        purpose
+        title
+        value
+      }
+    }
     subtotalPriceSet { shopMoney { amount currencyCode } }
     totalShippingPriceSet { shopMoney { amount currencyCode } }
     totalTaxSet { shopMoney { amount currencyCode } }
@@ -357,20 +411,64 @@ function buildBackfillDataFromOrder(order = {}, current = {}) {
   }));
   const pairs = [...attributes, ...metafields];
 
-  const fiscalCode = pairValue(pairs, ["fiscal_code", "codice_fiscale", "codice fiscale", "cf", "tax_code"]);
+  const localizedFiscalCode = getLocalizationExtensionValue(order, ["TAX_CREDENTIAL_IT"]);
+  const localizedPec = getLocalizationExtensionValue(order, ["TAX_EMAIL_IT"]);
+
+  const fiscalCode = localizedFiscalCode || pairValue(pairs, [
+    "fiscal_code",
+    "codice_fiscale",
+    "codice fiscale",
+    "codiceFiscale",
+    "Codice fiscale",
+    "Codice Fiscale",
+    "cf",
+    "tax_code",
+  ]);
   const vatFromPairs = pairValue(pairs, ["vat_number", "partita_iva", "partita iva", "piva", "vat_id", "tax_id"]);
-  const vatNumber = vatFromPairs || extractVatCandidate(billing.company, billing.firstName, billing.lastName, shipping.company);
-  const pec = pairValue(pairs, ["pec", "certified_email", "posta certificata"]);
-  const sdi = pairValue(pairs, ["sdi", "codice_sdi", "recipient_code", "codice_destinatario"]);
-  const invoiceType = pairValue(pairs, ["invoice_type"]) || (vatNumber || billing.company ? "company" : "private");
-  const countryCode = pairValue(pairs, ["invoice_country_code", "country_code"]) || billing.countryCodeV2 || shipping.countryCodeV2 || current.countryCode;
+  const vatNumber = vatFromPairs || extractVatCandidate(billing.company, billing.firstName, billing.lastName, shipping.company, fiscalCode);
+  let pec = localizedPec || pairValue(pairs, [
+    "pec",
+    "email_pec",
+    "email pec",
+    "indirizzo_pec",
+    "indirizzo pec",
+    "certified_email",
+    "certifiedEmail",
+    "posta certificata",
+    "posta elettronica certificata",
+  ]);
+
+  // Shopify localizationExtensions: TAX_CREDENTIAL_IT e TAX_EMAIL_IT vanno letti in modo stretto.
+  // Se un vecchio backfill aveva copiato il codice fiscale dentro PEC, lo ripuliamo.
+  if (!localizedPec && sameNormalizedValue(pec, fiscalCode)) {
+    pec = "";
+  }
+
+  const sdi = pairValue(pairs, [
+    "sdi",
+    "codice_sdi",
+    "codice sdi",
+    "recipient_code",
+    "codice_destinatario",
+    "codice destinatario",
+  ]);
+  let invoiceType = pairValue(pairs, ["invoice_type"]) || current.invoiceType || (vatNumber || billing.company ? "company" : "private");
+  if ((vatNumber || billing.company) && invoiceType !== "company") {
+    invoiceType = "company";
+  }
+  const vatCountry = clean(vatNumber).slice(0, 2).match(/^[A-Z]{2}$/) ? clean(vatNumber).slice(0, 2) : "";
+  const countryCode = pairValue(pairs, ["invoice_country_code", "country_code"]) || vatCountry || billing.countryCodeV2 || shipping.countryCodeV2 || current.countryCode;
 
   const notes = [
     formatBackfillBillingAddress(billing),
     formatBackfillOrderTotals(order),
     formatBackfillOrderItems(order.lineItems?.nodes || []),
-    order.note ? `Order note:\n${order.note}` : "",
-  ].filter(Boolean).join("\n\n");
+    formatLocalizationExtensions(order),
+    order.note ? `Order note:
+${order.note}` : "",
+  ].filter(Boolean).join("
+
+");
 
   return {
     orderId: order.legacyResourceId ? String(order.legacyResourceId) : clean(current.orderId),
@@ -381,10 +479,10 @@ function buildBackfillDataFromOrder(order = {}, current = {}) {
     countryCode: clean(countryCode).toUpperCase(),
     firstName: clean(billing.firstName || shipping.firstName || customer.firstName || current.firstName),
     lastName: clean(billing.lastName || shipping.lastName || customer.lastName || current.lastName),
-    fiscalCode,
-    vatNumber,
-    pec,
-    sdi,
+    fiscalCode: upperNullable(fiscalCode),
+    vatNumber: upperNullable(vatNumber),
+    pec: cleanNullable(pec),
+    sdi: upperNullable(sdi),
     companyName: clean(billing.company || shipping.company || current.companyName),
     status: "order_created",
     errorMessage: notes || current.errorMessage || null,
@@ -533,6 +631,52 @@ export async function action({ request }) {
     });
 
     return json({ ok: true, intent, id: updated.id, status: updated.status });
+  }
+
+  if (intent === "bulkBackfillMissing") {
+    const limit = Math.min(Math.max(Number(formData.get("limit") || 50), 1), 100);
+    const candidates = await prisma.invoiceRequest.findMany({
+      where: {
+        AND: [
+          buildOrderOnlyWhere(session.shop),
+          buildMissingWhere(),
+        ],
+      },
+      orderBy: { createdAt: "desc" },
+      take: limit,
+    });
+
+    let updated = 0;
+    let skipped = 0;
+    const errors = [];
+
+    for (const current of candidates) {
+      try {
+        const order = await fetchOrderForBackfill(admin, {
+          orderId: current.orderId,
+          orderName: current.orderName,
+        });
+        const backfillData = buildBackfillDataFromOrder(order, current);
+
+        await prisma.invoiceRequest.update({
+          where: { id: current.id },
+          data: backfillData,
+        });
+        updated += 1;
+      } catch (error) {
+        skipped += 1;
+        errors.push(`${current.orderName || current.orderId || current.id}: ${error?.message || "errore backfill"}`);
+      }
+    }
+
+    return json({
+      ok: true,
+      intent,
+      updated,
+      skipped,
+      status: `updated:${updated};skipped:${skipped}`,
+      error: errors.length ? errors.slice(0, 5).join(" | ") : undefined,
+    });
   }
 
   const id = clean(formData.get("id"));
@@ -713,6 +857,17 @@ export default function InvoiceRequestsPage() {
             <a href={resetHref} style={styles.secondaryLink} onClick={handleResetFilters}>Reset</a>
             <a href={exportHref} style={styles.secondaryLink}>Esporta CSV</a>
             <a href={printAllHref} style={styles.secondaryLink}>Stampa facsimili</a>
+            <fetcher.Form method="post" style={{ display: "inline" }}>
+              <input type="hidden" name="intent" value="bulkBackfillMissing" />
+              <input type="hidden" name="limit" value="100" />
+              <button
+                type="submit"
+                style={styles.smallButton}
+                disabled={fetcher.state !== "idle" && fetcher.formData?.get("intent") === "bulkBackfillMissing"}
+              >
+                {fetcher.state !== "idle" && fetcher.formData?.get("intent") === "bulkBackfillMissing" ? "Backfill..." : "Backfill missing vecchi"}
+              </button>
+            </fetcher.Form>
             <button
               type="button"
               style={styles.smallButton}
@@ -727,6 +882,12 @@ export default function InvoiceRequestsPage() {
 
         {fetcher.data?.ok && fetcher.data.intent === "createManual" && (
           <div style={styles.success}>Richiesta manuale creata correttamente.</div>
+        )}
+
+        {fetcher.data?.ok && fetcher.data.intent === "bulkBackfillMissing" && (
+          <div style={styles.success}>
+            Backfill completato: {fetcher.data.updated || 0} aggiornate, {fetcher.data.skipped || 0} saltate.
+          </div>
         )}
 
         {fetcher.data?.error && (
