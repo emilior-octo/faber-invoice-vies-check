@@ -17,21 +17,7 @@ function getPayloadAttributes(payload) {
 
 function getAttribute(payload, key) {
   const attrs = getPayloadAttributes(payload);
-  const targetKey = normalizeKey(key);
-
-  const found = attrs.find((item) => {
-    const itemKey = clean(item?.name || item?.key);
-    if (!itemKey) return false;
-
-    const normalizedItemKey = normalizeKey(itemKey);
-
-    return (
-      itemKey === key ||
-      normalizedItemKey === targetKey ||
-      normalizedItemKey.includes(targetKey) ||
-      targetKey.includes(normalizedItemKey)
-    );
-  });
+  const found = attrs.find((item) => item?.name === key || item?.key === key);
 
   if (found?.value !== undefined && found?.value !== null) {
     return clean(found.value);
@@ -319,6 +305,23 @@ function makePairsFromMetafields(nodes) {
   });
 }
 
+function makePairsFromLocalizationExtensions(nodes) {
+  return (nodes || []).flatMap((node) => {
+    const key = clean(node?.key);
+    const title = clean(node?.title);
+    const purpose = clean(node?.purpose);
+    const countryCode = clean(node?.countryCode);
+    const value = clean(node?.value);
+
+    return [
+      { key, value },
+      { key: title, value },
+      { key: purpose, value },
+      { key: countryCode && key ? `${countryCode}.${key}` : key, value },
+    ].filter((pair) => clean(pair.key));
+  });
+}
+
 function getPairValue(pairs, acceptedKeys) {
   const normalizedAcceptedKeys = acceptedKeys.map(normalizeKey).filter(Boolean);
 
@@ -374,6 +377,7 @@ async function syncInvoiceRequestWithOrder({
   viesChecked,
   viesValid,
   reverseCharge,
+  taxExemptApplied,
   administrativeNotes,
 }) {
   const where = buildWhere({ shop, invoiceRequestId, cartToken });
@@ -401,6 +405,7 @@ async function syncInvoiceRequestWithOrder({
       viesChecked: optionalBoolean(viesChecked),
       viesValid: optionalBoolean(viesValid),
       reverseCharge: optionalBoolean(reverseCharge),
+      taxExemptApplied: optionalBoolean(taxExemptApplied),
       status: "order_created",
       errorMessage: administrativeNotes || null,
     },
@@ -418,6 +423,15 @@ async function fetchNativeOrderFiscalData(admin, orderGid) {
         customAttributes {
           key
           value
+        }
+        localizationExtensions(first: 20) {
+          nodes {
+            countryCode
+            key
+            purpose
+            title
+            value
+          }
         }
         billingAddress {
           firstName
@@ -509,58 +523,49 @@ async function fetchNativeOrderFiscalData(admin, orderGid) {
   const billingAddress = order.billingAddress || {};
   const shippingAddress = order.shippingAddress || {};
   const customer = order.customer || {};
+  const localizationPairs = makePairsFromLocalizationExtensions(order.localizationExtensions?.nodes || []);
   const customerMetafieldPairs = makePairsFromMetafields(customer.metafields?.nodes || []);
   const orderAttributePairs = (order.customAttributes || []).map((item) => ({
     key: clean(item?.key),
     value: clean(item?.value),
   }));
 
-  const allPairs = [...orderAttributePairs, ...customerMetafieldPairs];
+  // Priority: native Shopify localized checkout fields first, then custom attributes, then customer metafields.
+  const allPairs = [...localizationPairs, ...orderAttributePairs, ...customerMetafieldPairs];
 
   const fiscalCode = getPairValue(allPairs, [
+    "TAX_CREDENTIAL_IT",
+    "IT.TAX_CREDENTIAL_IT",
+    "tax credential",
     "fiscal_code",
     "fiscalCode",
     "codice_fiscale",
     "codice fiscale",
     "codiceFiscale",
-    "Codice fiscale",
-    "Codice Fiscale",
-    "codice fiscale / cf",
     "tax_code",
     "taxCode",
-    "tax code",
     "cf",
-    "CF",
   ]);
 
   const pec = getPairValue(allPairs, [
+    "TAX_EMAIL_IT",
+    "IT.TAX_EMAIL_IT",
+    "tax email",
     "pec",
-    "PEC",
-    "email_pec",
-    "email pec",
-    "pec_email",
-    "pec email",
-    "indirizzo_pec",
-    "indirizzo pec",
     "certified_email",
     "certifiedEmail",
-    "certified email",
     "posta certificata",
     "posta_elettronica_certificata",
-    "posta elettronica certificata",
   ]);
 
   const sdi = getPairValue(allPairs, [
     "sdi",
-    "SDI",
     "codice_sdi",
     "codice sdi",
     "recipient_code",
     "recipientCode",
     "codice_destinatario",
     "codice destinatario",
-    "codice_univoco",
-    "codice univoco",
   ]);
 
   const vatNumber = getPairValue(allPairs, [
@@ -574,14 +579,18 @@ async function fetchNativeOrderFiscalData(admin, orderGid) {
     "taxId",
   ]);
 
-  console.log("[orders/create] Native fiscal enrichment", {
+  console.log("[orders/create] Native localized fiscal enrichment", {
     orderGid,
-    customAttributes: orderAttributePairs,
-    customerMetafields: customerMetafieldPairs,
+    localizationExtensions: (order.localizationExtensions?.nodes || []).map((field) => ({
+      countryCode: field?.countryCode,
+      key: field?.key,
+      purpose: field?.purpose,
+      title: field?.title,
+      value: field?.value ? "[present]" : "",
+    })),
     fiscalCodeFound: Boolean(fiscalCode),
     pecFound: Boolean(pec),
     sdiFound: Boolean(sdi),
-    vatNumberFound: Boolean(vatNumber),
   });
 
   return {
@@ -681,49 +690,19 @@ export async function action({ request }) {
     "fiscalCode",
     "codice_fiscale",
     "codice fiscale",
-    "codiceFiscale",
-    "Codice fiscale",
     "Codice Fiscale",
-    "codice fiscale / cf",
     "cf",
-    "CF",
     "tax_code",
     "taxCode",
-    "tax code",
   ]);
   const vatNumberFromAttributes = getFirstAttribute(payload, ["vat_number", "vatNumber", "partita_iva", "partita iva", "piva"]);
   const invoiceCountryCode = getFirstAttribute(payload, ["invoice_country_code", "country_code"]);
-  const pecFromAttributes = getFirstAttribute(payload, [
-    "pec",
-    "PEC",
-    "email_pec",
-    "email pec",
-    "pec_email",
-    "pec email",
-    "indirizzo_pec",
-    "indirizzo pec",
-    "posta certificata",
-    "posta_elettronica_certificata",
-    "posta elettronica certificata",
-    "certified_email",
-    "certifiedEmail",
-    "certified email",
-  ]);
-  const sdiFromAttributes = getFirstAttribute(payload, [
-    "sdi",
-    "SDI",
-    "codice_sdi",
-    "codice sdi",
-    "codice_destinatario",
-    "codice destinatario",
-    "codice_univoco",
-    "codice univoco",
-    "recipient_code",
-    "recipientCode",
-  ]);
+  const pecFromAttributes = getFirstAttribute(payload, ["pec", "PEC", "certified_email", "certifiedEmail"]);
+  const sdiFromAttributes = getFirstAttribute(payload, ["sdi", "SDI", "codice_sdi", "recipient_code"]);
   const viesChecked = getAttribute(payload, "vies_checked");
   const viesValid = getAttribute(payload, "vies_valid");
   const reverseCharge = getAttribute(payload, "reverse_charge");
+  const taxExemptApplied = getAttribute(payload, "tax_exempt_applied");
   const companyNameFromAttributes = getAttribute(payload, "company_name");
   const customerEmailFromPayload = getCustomerEmail(payload);
   const customerIdFromPayload = getCustomerId(payload);
@@ -757,7 +736,21 @@ export async function action({ request }) {
   const finalCountryCode = invoiceCountryCode || enrichedFiscalData?.countryCode || "";
   const orderTotalsNote = formatOrderTotals(payload);
   const orderItemsNote = enrichedFiscalData?.orderItemsNote || formatPayloadOrderItems(payload);
+  const fiscalDecisionNote = [
+    "Invoice fiscal flags:",
+    `Invoice type: ${invoiceType || "—"}`,
+    `VIES checked: ${viesChecked || "—"}`,
+    `VIES valid: ${viesValid || "—"}`,
+    `Reverse charge: ${reverseCharge || "—"}`,
+    `Tax exempt applied: ${taxExemptApplied || "—"}`,
+    fiscalCode ? `Codice fiscale: ${fiscalCode}` : "Codice fiscale: —",
+    pec ? `PEC: ${pec}` : "PEC: —",
+    sdi ? `SDI: ${sdi}` : "SDI: —",
+    vatNumber ? `VAT: ${vatNumber}` : "VAT: —",
+  ].join("\n");
+
   const administrativeNotes = [
+    fiscalDecisionNote,
     enrichedFiscalData?.billingAddressNote || "",
     orderTotalsNote,
     orderItemsNote,
@@ -786,6 +779,7 @@ export async function action({ request }) {
       viesChecked,
       viesValid,
       reverseCharge,
+      taxExemptApplied,
       administrativeNotes,
     });
 
@@ -807,6 +801,7 @@ export async function action({ request }) {
       vies_checked: viesChecked,
       vies_valid: viesValid,
       reverse_charge: reverseCharge,
+      tax_exempt_applied: taxExemptApplied,
       invoice_request_id: invoiceRequestId,
     });
 
@@ -816,6 +811,8 @@ export async function action({ request }) {
       invoiceType === "company" ? "invoice_company" : "",
       viesValid === "true" ? "vies_valid" : "",
       reverseCharge === "true" ? "reverse_charge" : "",
+      taxExemptApplied === "true" ? "tax_exempt_applied" : "",
+      viesChecked === "true" && viesValid !== "true" && reverseCharge === "true" ? "invoice_manual_review" : "",
     ]);
 
     return new Response(`OK - invoice synced (${invoiceSyncCount})`, { status: 200 });
