@@ -309,14 +309,17 @@ function makePairsFromLocalizationExtensions(nodes) {
   return (nodes || []).flatMap((node) => {
     const key = clean(node?.key);
     const title = clean(node?.title);
-    const purpose = clean(node?.purpose);
     const countryCode = clean(node?.countryCode);
     const value = clean(node?.value);
 
+    // IMPORTANT:
+    // Do not use `purpose` as a lookup key here.
+    // Shopify localized fiscal fields often share a generic purpose like TAX,
+    // and matching PEC against TAX would incorrectly return the first fiscal value
+    // (usually the codice fiscale) as the PEC.
     return [
       { key, value },
       { key: title, value },
-      { key: purpose, value },
       { key: countryCode && key ? `${countryCode}.${key}` : key, value },
     ].filter((pair) => clean(pair.key));
   });
@@ -331,14 +334,9 @@ function getPairValue(pairs, acceptedKeys) {
 
     if (!normalizedPairKey || !value) continue;
 
-    if (
-      normalizedAcceptedKeys.some(
-        (acceptedKey) =>
-          normalizedPairKey === acceptedKey ||
-          normalizedPairKey.includes(acceptedKey) ||
-          acceptedKey.includes(normalizedPairKey)
-      )
-    ) {
+    // Strict matching only. The previous bidirectional includes check allowed
+    // generic keys such as TAX to match TAX_EMAIL_IT and polluted PEC with CF.
+    if (normalizedAcceptedKeys.includes(normalizedPairKey)) {
       return value;
     }
   }
