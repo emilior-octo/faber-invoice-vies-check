@@ -17,7 +17,21 @@ function getPayloadAttributes(payload) {
 
 function getAttribute(payload, key) {
   const attrs = getPayloadAttributes(payload);
-  const found = attrs.find((item) => item?.name === key || item?.key === key);
+  const targetKey = normalizeKey(key);
+
+  const found = attrs.find((item) => {
+    const itemKey = clean(item?.name || item?.key);
+    if (!itemKey) return false;
+
+    const normalizedItemKey = normalizeKey(itemKey);
+
+    return (
+      itemKey === key ||
+      normalizedItemKey === targetKey ||
+      normalizedItemKey.includes(targetKey) ||
+      targetKey.includes(normalizedItemKey)
+    );
+  });
 
   if (found?.value !== undefined && found?.value !== null) {
     return clean(found.value);
@@ -509,27 +523,44 @@ async function fetchNativeOrderFiscalData(admin, orderGid) {
     "codice_fiscale",
     "codice fiscale",
     "codiceFiscale",
+    "Codice fiscale",
+    "Codice Fiscale",
+    "codice fiscale / cf",
     "tax_code",
     "taxCode",
+    "tax code",
     "cf",
+    "CF",
   ]);
 
   const pec = getPairValue(allPairs, [
     "pec",
+    "PEC",
+    "email_pec",
+    "email pec",
+    "pec_email",
+    "pec email",
+    "indirizzo_pec",
+    "indirizzo pec",
     "certified_email",
     "certifiedEmail",
+    "certified email",
     "posta certificata",
     "posta_elettronica_certificata",
+    "posta elettronica certificata",
   ]);
 
   const sdi = getPairValue(allPairs, [
     "sdi",
+    "SDI",
     "codice_sdi",
     "codice sdi",
     "recipient_code",
     "recipientCode",
     "codice_destinatario",
     "codice destinatario",
+    "codice_univoco",
+    "codice univoco",
   ]);
 
   const vatNumber = getPairValue(allPairs, [
@@ -542,6 +573,16 @@ async function fetchNativeOrderFiscalData(admin, orderGid) {
     "tax_id",
     "taxId",
   ]);
+
+  console.log("[orders/create] Native fiscal enrichment", {
+    orderGid,
+    customAttributes: orderAttributePairs,
+    customerMetafields: customerMetafieldPairs,
+    fiscalCodeFound: Boolean(fiscalCode),
+    pecFound: Boolean(pec),
+    sdiFound: Boolean(sdi),
+    vatNumberFound: Boolean(vatNumber),
+  });
 
   return {
     orderName: clean(order.name),
@@ -640,15 +681,46 @@ export async function action({ request }) {
     "fiscalCode",
     "codice_fiscale",
     "codice fiscale",
+    "codiceFiscale",
+    "Codice fiscale",
     "Codice Fiscale",
+    "codice fiscale / cf",
     "cf",
+    "CF",
     "tax_code",
     "taxCode",
+    "tax code",
   ]);
   const vatNumberFromAttributes = getFirstAttribute(payload, ["vat_number", "vatNumber", "partita_iva", "partita iva", "piva"]);
   const invoiceCountryCode = getFirstAttribute(payload, ["invoice_country_code", "country_code"]);
-  const pecFromAttributes = getFirstAttribute(payload, ["pec", "PEC", "certified_email", "certifiedEmail"]);
-  const sdiFromAttributes = getFirstAttribute(payload, ["sdi", "SDI", "codice_sdi", "recipient_code"]);
+  const pecFromAttributes = getFirstAttribute(payload, [
+    "pec",
+    "PEC",
+    "email_pec",
+    "email pec",
+    "pec_email",
+    "pec email",
+    "indirizzo_pec",
+    "indirizzo pec",
+    "posta certificata",
+    "posta_elettronica_certificata",
+    "posta elettronica certificata",
+    "certified_email",
+    "certifiedEmail",
+    "certified email",
+  ]);
+  const sdiFromAttributes = getFirstAttribute(payload, [
+    "sdi",
+    "SDI",
+    "codice_sdi",
+    "codice sdi",
+    "codice_destinatario",
+    "codice destinatario",
+    "codice_univoco",
+    "codice univoco",
+    "recipient_code",
+    "recipientCode",
+  ]);
   const viesChecked = getAttribute(payload, "vies_checked");
   const viesValid = getAttribute(payload, "vies_valid");
   const reverseCharge = getAttribute(payload, "reverse_charge");
