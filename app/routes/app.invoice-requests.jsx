@@ -65,6 +65,33 @@ function normalizeRequest(item) {
   };
 }
 
+
+function isViesTechnicalIssue(item) {
+  const note = clean(item?.errorMessage).toUpperCase();
+  return (
+    item?.status === "pending_review" &&
+    (note.includes("ERRORE TECNICO VIES") ||
+      note.includes("MS_MAX_CONCURRENT_REQ") ||
+      note.includes("MS_UNAVAILABLE") ||
+      note.includes("SERVICE_UNAVAILABLE") ||
+      note.includes("VIES_UNAVAILABLE"))
+  );
+}
+
+function viesLabel(item) {
+  if (isViesTechnicalIssue(item)) return "Busy";
+  if (item?.viesValid) return "Valid";
+  if (item?.viesChecked) return "Invalid";
+  return "—";
+}
+
+function viesTone(item) {
+  if (isViesTechnicalIssue(item)) return "warning";
+  if (item?.viesValid) return "success";
+  if (item?.viesChecked) return "error";
+  return "neutral";
+}
+
 function getShopHandle(shop) {
   return String(shop || "").replace(".myshopify.com", "");
 }
@@ -872,8 +899,8 @@ export default function InvoiceRequestsPage() {
                       {request.countryCode || "—"} {request.vatNumber || ""}
                     </td>
                     <td style={styles.td}>
-                      <Badge tone={request.viesValid ? "success" : request.viesChecked ? "error" : "neutral"}>
-                        {request.viesValid ? "Valid" : request.viesChecked ? "Invalid" : "—"}
+                      <Badge tone={viesTone(request)}>
+                        {viesLabel(request)}
                       </Badge>
                     </td>
                     <td style={styles.td}>
@@ -1096,7 +1123,7 @@ function RequestDetail({ shop, request, fetcher, embeddedSearch = "", onClose })
               <Detail label="PEC" value={request.pec || "—"} />
               <Detail label="SDI" value={request.sdi || "—"} />
               <Detail label="VIES checked" value={request.viesChecked ? "Yes" : "No"} />
-              <Detail label="VIES valid" value={request.viesValid === null || request.viesValid === undefined ? "—" : request.viesValid ? "Yes" : "No"} />
+              <Detail label="VIES valid" value={isViesTechnicalIssue(request) ? "Sistema VIES occupato / verifica non eseguita" : request.viesValid === null || request.viesValid === undefined ? "—" : request.viesValid ? "Yes" : "No"} />
               <Detail label="Reverse charge" value={request.reverseCharge ? "Yes" : "No"} />
               <Detail label="Tax exempt applied" value={request.taxExemptApplied ? "Yes" : "No"} />
             </>
@@ -1106,7 +1133,7 @@ function RequestDetail({ shop, request, fetcher, embeddedSearch = "", onClose })
           <Detail label="Invoice request ID" value={request.id} />
           <Detail label="Cart token" value={request.cartToken || "—"} />
           <Detail label="Checkout token" value={request.checkoutToken || "—"} />
-          <Detail label="Note amministrative / Prodotti" value={request.errorMessage || "—"} />
+          <Detail label="Note VIES / amministrative / Prodotti" value={request.errorMessage || "—"} />
         </div>
 
         <UpdateFiscalForm request={request} fetcher={fetcher} />

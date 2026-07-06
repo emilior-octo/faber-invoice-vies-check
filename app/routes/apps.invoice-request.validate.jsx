@@ -56,9 +56,10 @@ function classifyViesSoapError(error) {
   const raw = JSON.stringify(error || {});
   const combined = `${message} ${raw}`.toUpperCase();
 
+  if (combined.includes("MS_MAX_CONCURRENT_REQ")) return "MS_MAX_CONCURRENT_REQ";
   if (combined.includes("MS_UNAVAILABLE")) return "MS_UNAVAILABLE";
   if (combined.includes("SERVICE_UNAVAILABLE")) return "SERVICE_UNAVAILABLE";
-  if (combined.includes("TIMEOUT") || combined.includes("ETIMEDOUT")) return "TIMEOUT";
+  if (combined.includes("TIMEOUT") || combined.includes("ETIMEDOUT") || combined.includes("ECONNRESET")) return "TIMEOUT";
   if (combined.includes("INVALID_INPUT")) return "INVALID_INPUT";
 
   return "VIES_TECHNICAL_ERROR";
@@ -76,14 +77,14 @@ function messages(locale) {
     requiredVat: isIt
       ? "Paese e partita IVA sono obbligatori."
       : "Country and VAT number are required.",
-    viesUnavailable: (countryCode, fullVatNumber) =>
+    viesUnavailable: () =>
       isIt
-        ? `Verifica VIES non disponibile per questa partita IVA (${countryCode} ${fullVatNumber}). Reverse charge applicato con controllo manuale richiesto.`
-        : `VIES validation is unavailable for this VAT number (${countryCode} ${fullVatNumber}). Reverse charge has been applied with manual review required.`,
+        ? "VIES momentaneamente occupato. Richiesta fattura registrata: completa il checkout e, se ti serve reverse charge, contatta l’assistenza."
+        : "VIES is temporarily busy. Your invoice request was saved: complete checkout and contact support if you need reverse charge.",
     invalidVat: (fullVatNumber) =>
       isIt
-        ? `Partita IVA non valida su VIES (${fullVatNumber}). Reverse charge non applicato.`
-        : `VAT number is not valid in VIES (${fullVatNumber}). Reverse charge has not been applied.`,
+        ? `VAT non validato (${fullVatNumber}). Richiesta fattura registrata: completa il checkout e contatta l’assistenza se serve verifica.`
+        : `VAT could not be validated (${fullVatNumber}). Your invoice request was saved: complete checkout and contact support if you need verification.`,
     reverseChargeSaved: isIt
       ? "Reverse charge validato. La richiesta fattura è stata salvata."
       : "Reverse charge validated. Your invoice request has been saved.",
@@ -456,13 +457,13 @@ export async function action({ request }) {
       reverseCharge = viesValid === true;
 
       if (viesRawResponse?.unavailable) {
-        // Business rule: do not block reverse charge for technical VIES failures
-        // (for example MS_UNAVAILABLE on a member-state database).
-        // We apply reverse charge, prepare the customer tax exemption if possible,
-        // and mark the request for manual review in the DB.
+        // Business rule: never block checkout for technical VIES failures.
+        // The invoice request is saved for manual review, but reverse charge/tax exempt
+        // are NOT applied automatically because VIES did not confirm validity.
         viesUnavailable = true;
+        viesChecked = false;
         viesValid = null;
-        reverseCharge = true;
+        reverseCharge = false;
       }
 
       if (!viesUnavailable && viesValid !== true) {
@@ -489,25 +490,28 @@ export async function action({ request }) {
             viesRawResponse: JSON.stringify(viesRawResponse),
             reverseCharge: false,
             taxExemptApplied: false,
-            status: "failed",
+            status: "pending_review",
             errorMessage,
           },
         });
 
-        return responseJson(
-          {
-            ok: false,
-            invoiceRequestId: invoiceRequest.id,
-            invoiceType,
-            vatNumber: fullVatNumber,
-            viesChecked,
-            viesValid: false,
-            reverseCharge: false,
-            taxExemptApplied: false,
-            error: errorMessage,
-          },
-          400,
-        );
+        return responseJson({
+          ok: true,
+          invoiceRequestId: invoiceRequest.id,
+          invoiceType,
+          vatNumber: fullVatNumber,
+          viesChecked,
+          viesValid: false,
+          reverseCharge: false,
+          taxExemptApplied: false,
+          taxExemptCustomerPrepared: false,
+          pendingManualReview: true,
+          reviewRequired: true,
+          viesTechnicalError: false,
+          customerEmail,
+          customerId: preparedCustomerGid || customerGid || customerId || "",
+          message: errorMessage,
+        });
       }
 
       if (reverseCharge && customerGid) {
@@ -569,7 +573,7 @@ export async function action({ request }) {
         taxExemptApplied,
         status: viesUnavailable ? "pending_review" : invoiceType === "private" ? "registered" : "validated",
         errorMessage: viesUnavailable
-          ? `ATTENZIONE: reverse charge applicato, ma verifica VIES non disponibile (${viesRawResponse?.errorCode || "VIES_UNAVAILABLE"}). Controllo manuale richiesto.`
+          ? `Errore tecnico VIES: ${viesRawResponse?.errorCode || "VIES_UNAVAILABLE"}${viesRawResponse?.errorMessage ? ` - ${viesRawResponse.errorMessage}` : ""}`
           : taxExemptApplied || taxExemptCustomerPrepared || !reverseCharge
             ? null
             : "VIES valido, ma reverse charge non confermato sul cliente Shopify.",
@@ -586,6 +590,8 @@ export async function action({ request }) {
       reverseCharge,
       taxExemptApplied,
       viesUnavailable,
+      viesTechnicalError: viesUnavailable,
+      pendingManualReview: viesUnavailable,
       taxExemptCustomerPrepared,
       reviewRequired: viesUnavailable,
       viesErrorCode: viesRawResponse?.errorCode || "",
@@ -595,7 +601,7 @@ export async function action({ request }) {
       customerId: preparedCustomerGid || customerGid || customerId || "",
       message: reverseCharge
         ? viesUnavailable
-          ? i18n.viesUnavailable(countryCode, fullVatNumber)
+          ? i18n.viesUnavailable()
           : customerGid && taxExemptApplied
             ? i18n.loggedTaxExemptApplied
             : taxExemptCustomerPrepared
