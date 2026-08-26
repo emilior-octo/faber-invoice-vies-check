@@ -310,8 +310,7 @@ async function getPreCheckoutCompanyFromCustomer(admin, customerGid, vatNumber) 
   const query = `#graphql
     query InvoicePreCheckoutCustomerCompanies($id: ID!) {
       customer(id: $id) {
-        companyContactProfiles(first: 20) {
-          nodes {
+        companyContactProfiles {
             id
             roleAssignments(first: 50) {
               nodes {
@@ -320,14 +319,13 @@ async function getPreCheckoutCompanyFromCustomer(admin, customerGid, vatNumber) 
                 role { id name }
               }
             }
-            company {
-              id
-              name
-              externalId
-              locations(first: 20) { nodes { id name } }
-              defaultRole { id name }
-              contactRoles(first: 20) { nodes { id name } }
-            }
+          company {
+            id
+            name
+            externalId
+            locations(first: 20) { nodes { id name } }
+            defaultRole { id name }
+            contactRoles(first: 20) { nodes { id name } }
           }
         }
       }
@@ -335,7 +333,7 @@ async function getPreCheckoutCompanyFromCustomer(admin, customerGid, vatNumber) 
   `;
 
   const data = await graphQL(admin, query, { id: customerGid });
-  const profiles = data?.data?.customer?.companyContactProfiles?.nodes || [];
+  const profiles = data?.data?.customer?.companyContactProfiles || [];
 
   const exactVatProfile = profiles.find(
     (profile) => clean(profile?.company?.externalId) === wantedExternalId,
