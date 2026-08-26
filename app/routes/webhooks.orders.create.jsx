@@ -605,6 +605,8 @@ async function fetchNativeOrderFiscalData(admin, orderGid) {
     companyName: clean(billingAddress.company || shippingAddress.company),
     countryCode: clean(billingAddress.countryCodeV2 || shippingAddress.countryCodeV2),
     billingAddressNote: formatBillingAddress(billingAddress),
+    billingAddress,
+    shippingAddress,
     orderItemsNote: formatOrderItems(order.lineItems?.nodes || []),
   };
 }
@@ -661,6 +663,346 @@ async function addOrderTags(admin, orderGid, tags) {
   if (errors.length) {
     throw new Error(errors.map((error) => error.message).join(" | "));
   }
+}
+
+
+
+function toCustomerGid(customerId) {
+  const raw = clean(customerId);
+  if (!raw) return "";
+  return raw.startsWith("gid://") ? raw : `gid://shopify/Customer/${raw}`;
+}
+
+function normalizeVatForCompany(value) {
+  return clean(value).toUpperCase().replace(/[\s.\-_/]/g, "");
+}
+
+function buildCompanyAddress(address = {}, fallback = {}) {
+  const source = address && Object.keys(address).length ? address : fallback || {};
+  const countryCode = clean(source.countryCodeV2 || source.country_code || source.countryCode);
+  const zoneCode = clean(source.provinceCode || source.province_code || source.zoneCode);
+
+  const result = {
+    firstName: clean(source.firstName || source.first_name),
+    lastName: clean(source.lastName || source.last_name),
+    address1: clean(source.address1),
+    address2: clean(source.address2),
+    city: clean(source.city),
+    zip: clean(source.zip),
+    countryCode,
+    zoneCode,
+    phone: clean(source.phone),
+  };
+
+  return Object.fromEntries(Object.entries(result).filter(([, value]) => Boolean(value)));
+}
+
+async function updateCustomerIdentity(admin, customerId, firstName, lastName) {
+  const customerGid = toCustomerGid(customerId);
+  if (!customerGid || (!clean(firstName) && !clean(lastName))) return;
+
+  const mutation = `#graphql
+    mutation UpdateInvoiceCustomerIdentity($input: CustomerInput!) {
+      customerUpdate(input: $input) {
+        customer { id firstName lastName }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const response = await admin.graphql(mutation, {
+    variables: {
+      input: {
+        id: customerGid,
+        ...(clean(firstName) ? { firstName: clean(firstName) } : {}),
+        ...(clean(lastName) ? { lastName: clean(lastName) } : {}),
+      },
+    },
+  });
+
+  const data = await response.json();
+  const errors = data?.data?.customerUpdate?.userErrors || [];
+  if (errors.length) throw new Error(errors.map((error) => error.message).join(" | "));
+}
+
+async function findCompanyForInvoice(admin, customerGid, companyName, vatNumber) {
+  if (customerGid) {
+    const response = await admin.graphql(`#graphql
+      query InvoiceCustomerCompanies($id: ID!) {
+        customer(id: $id) {
+          companyContactProfiles {
+            company {
+              id
+              name
+              externalId
+              locations(first: 10) {
+                nodes { id name }
+              }
+            }
+          }
+        }
+      }
+    `, { variables: { id: customerGid } });
+
+    const data = await response.json();
+    if (data?.errors?.length) throw new Error(data.errors.map((error) => error.message).join(" | "));
+
+    const profiles = data?.data?.customer?.companyContactProfiles || [];
+    const wantedName = clean(companyName).toLowerCase();
+    const exact = profiles.find((profile) => clean(profile?.company?.name).toLowerCase() === wantedName);
+    if (exact?.company?.id) return exact.company;
+    if (profiles.length === 1 && profiles[0]?.company?.id) return profiles[0].company;
+  }
+
+  const vat = normalizeVatForCompany(vatNumber);
+  if (vat) {
+    const externalId = `invoice-${vat}`;
+    const response = await admin.graphql(`#graphql
+      query InvoiceCompanyByExternalId($query: String!) {
+        companies(first: 10, query: $query) {
+          nodes {
+            id
+            name
+            externalId
+            locations(first: 10) { nodes { id name } }
+          }
+        }
+      }
+    `, { variables: { query: `external_id:${externalId}` } });
+
+    const data = await response.json();
+    if (data?.errors?.length) throw new Error(data.errors.map((error) => error.message).join(" | "));
+    const company = (data?.data?.companies?.nodes || []).find((item) => item?.externalId === externalId);
+    if (company?.id) return company;
+  }
+
+  const wantedName = clean(companyName);
+  if (wantedName) {
+    const response = await admin.graphql(`#graphql
+      query InvoiceCompanyByName($query: String!) {
+        companies(first: 20, query: $query) {
+          nodes {
+            id
+            name
+            externalId
+            locations(first: 10) { nodes { id name } }
+          }
+        }
+      }
+    `, { variables: { query: wantedName } });
+
+    const data = await response.json();
+    if (data?.errors?.length) throw new Error(data.errors.map((error) => error.message).join(" | "));
+    const exact = (data?.data?.companies?.nodes || []).find(
+      (item) => clean(item?.name).toLowerCase() === wantedName.toLowerCase(),
+    );
+    if (exact?.id) return exact;
+  }
+
+  return null;
+}
+
+async function createCompanyForInvoice(admin, {
+  companyName,
+  vatNumber,
+  billingAddress,
+  shippingAddress,
+  reverseCharge,
+}) {
+  const vat = normalizeVatForCompany(vatNumber);
+  const address = buildCompanyAddress(billingAddress, shippingAddress);
+  const companyLocation = {
+    name: clean(companyName),
+    shippingAddress: address,
+    billingSameAsShipping: true,
+    ...(vat ? { taxRegistrationId: vat } : {}),
+    ...(reverseCharge
+      ? {
+          taxExempt: true,
+          taxExemptions: ["EU_REVERSE_CHARGE_EXEMPTION_RULE"],
+        }
+      : {}),
+  };
+
+  const mutation = `#graphql
+    mutation CreateInvoiceCompany($input: CompanyCreateInput!) {
+      companyCreate(input: $input) {
+        company {
+          id
+          name
+          externalId
+          locations(first: 10) { nodes { id name } }
+        }
+        userErrors { field message code }
+      }
+    }
+  `;
+
+  const response = await admin.graphql(mutation, {
+    variables: {
+      input: {
+        company: {
+          name: clean(companyName),
+          ...(vat ? { externalId: `invoice-${vat}` } : {}),
+        },
+        companyLocation,
+      },
+    },
+  });
+
+  const data = await response.json();
+  const errors = data?.data?.companyCreate?.userErrors || [];
+  if (errors.length) throw new Error(errors.map((error) => error.message).join(" | "));
+
+  return data?.data?.companyCreate?.company || null;
+}
+
+async function assignCustomerToCompany(admin, companyId, customerGid) {
+  if (!companyId || !customerGid) return;
+
+  const mutation = `#graphql
+    mutation AssignInvoiceCustomerToCompany($companyId: ID!, $customerId: ID!) {
+      companyAssignCustomerAsContact(companyId: $companyId, customerId: $customerId) {
+        companyContact { id }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const response = await admin.graphql(mutation, {
+    variables: { companyId, customerId: customerGid },
+  });
+  const data = await response.json();
+  const errors = data?.data?.companyAssignCustomerAsContact?.userErrors || [];
+  if (errors.length) {
+    const message = errors.map((error) => error.message).join(" | ");
+    if (!/already|contact/i.test(message)) throw new Error(message);
+  }
+}
+
+async function setInvoiceCompanyMetafields(admin, ownerIds, fields) {
+  const ids = (ownerIds || []).filter(Boolean);
+  if (!ids.length) return;
+
+  const metafields = ids.flatMap((ownerId) =>
+    Object.entries(fields)
+      .filter(([, value]) => value !== undefined && value !== null && value !== "")
+      .map(([key, value]) => ({
+        ownerId,
+        namespace: "custom",
+        key,
+        type: "single_line_text_field",
+        value: String(value),
+      })),
+  );
+
+  if (!metafields.length) return;
+
+  const mutation = `#graphql
+    mutation SetInvoiceCompanyFiscalMetafields($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const response = await admin.graphql(mutation, { variables: { metafields } });
+  const data = await response.json();
+  const errors = data?.data?.metafieldsSet?.userErrors || [];
+  if (errors.length) throw new Error(errors.map((error) => error.message).join(" | "));
+}
+
+async function applyCompanyTaxSettings(admin, locationId, vatNumber, reverseCharge) {
+  if (!locationId) return;
+
+  const mutation = `#graphql
+    mutation ApplyInvoiceCompanyTaxSettings(
+      $companyLocationId: ID!,
+      $taxRegistrationId: String,
+      $taxExempt: Boolean,
+      $exemptionsToAssign: [TaxExemption!]
+    ) {
+      companyLocationTaxSettingsUpdate(
+        companyLocationId: $companyLocationId,
+        taxRegistrationId: $taxRegistrationId,
+        taxExempt: $taxExempt,
+        exemptionsToAssign: $exemptionsToAssign
+      ) {
+        companyLocation { id }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const response = await admin.graphql(mutation, {
+    variables: {
+      companyLocationId: locationId,
+      taxRegistrationId: normalizeVatForCompany(vatNumber) || null,
+      taxExempt: reverseCharge ? true : null,
+      exemptionsToAssign: reverseCharge ? ["EU_REVERSE_CHARGE_EXEMPTION_RULE"] : [],
+    },
+  });
+
+  const data = await response.json();
+  const errors = data?.data?.companyLocationTaxSettingsUpdate?.userErrors || [];
+  if (errors.length) throw new Error(errors.map((error) => error.message).join(" | "));
+}
+
+async function ensureInvoiceCompany(admin, {
+  customerId,
+  companyName,
+  vatNumber,
+  countryCode,
+  pec,
+  sdi,
+  fiscalCode,
+  reverseCharge,
+  billingAddress,
+  shippingAddress,
+}) {
+  const customerGid = toCustomerGid(customerId);
+  if (!customerGid || !clean(companyName)) return null;
+
+  let company = await findCompanyForInvoice(admin, customerGid, companyName, vatNumber);
+  if (!company?.id) {
+    company = await createCompanyForInvoice(admin, {
+      companyName,
+      vatNumber,
+      billingAddress,
+      shippingAddress,
+      reverseCharge,
+    });
+  }
+  if (!company?.id) throw new Error("Company creation returned no company ID");
+
+  await assignCustomerToCompany(admin, company.id, customerGid);
+
+  const locationId = company.locations?.nodes?.[0]?.id || "";
+  if (locationId) {
+    await applyCompanyTaxSettings(admin, locationId, vatNumber, reverseCharge);
+  }
+
+  await setInvoiceCompanyMetafields(admin, [company.id, locationId], {
+    invoice_type: "company",
+    company_name: companyName,
+    vat_number: normalizeVatForCompany(vatNumber),
+    invoice_country_code: clean(countryCode).toUpperCase(),
+    pec: clean(pec).toLowerCase(),
+    sdi: clean(sdi).toUpperCase(),
+    fiscal_code: clean(fiscalCode).toUpperCase(),
+    reverse_charge: String(Boolean(reverseCharge)),
+  });
+
+  console.log("[orders/create] Invoice company ensured", {
+    customerGid,
+    companyId: company.id,
+    companyName: company.name,
+    locationId,
+    vatNumber: normalizeVatForCompany(vatNumber),
+    reverseCharge: Boolean(reverseCharge),
+  });
+
+  return { companyId: company.id, locationId };
 }
 
 export async function action({ request }) {
@@ -784,6 +1126,55 @@ export async function action({ request }) {
     invoiceSyncCount = syncResult?.count || 0;
   } catch (error) {
     return new Response(error?.message || "Invoice request DB sync failed", { status: 500 });
+  }
+
+  let customerCompanySyncNote = "";
+
+  try {
+    if (customerId) {
+      await updateCustomerIdentity(admin, customerId, firstName, lastName);
+    }
+
+    if (invoiceType === "company" && customerId && companyName) {
+      const companyResult = await ensureInvoiceCompany(admin, {
+        customerId,
+        companyName,
+        vatNumber,
+        countryCode: finalCountryCode,
+        pec,
+        sdi,
+        fiscalCode,
+        reverseCharge: reverseCharge === "true",
+        billingAddress: enrichedFiscalData?.billingAddress || payload?.billing_address || payload?.billingAddress || {},
+        shippingAddress: enrichedFiscalData?.shippingAddress || payload?.shipping_address || payload?.shippingAddress || {},
+      });
+
+      if (companyResult?.companyId) {
+        customerCompanySyncNote = `Company sync: ${companyResult.companyId}${companyResult.locationId ? ` / ${companyResult.locationId}` : ""}`;
+      }
+    }
+  } catch (error) {
+    customerCompanySyncNote = `Company/customer sync failed: ${error?.message || "Unknown error"}`;
+    console.error("[orders/create] Company/customer sync failed", {
+      shop,
+      orderGid,
+      customerId,
+      companyName,
+      vatNumber,
+      error: error?.message || String(error),
+    });
+  }
+
+  if (customerCompanySyncNote) {
+    const where = buildWhere({ shop, invoiceRequestId, cartToken });
+    if (where) {
+      await prisma.invoiceRequest.updateMany({
+        where,
+        data: {
+          errorMessage: appendSystemNote(administrativeNotes, `System notes:\n${customerCompanySyncNote}`),
+        },
+      });
+    }
   }
 
   try {

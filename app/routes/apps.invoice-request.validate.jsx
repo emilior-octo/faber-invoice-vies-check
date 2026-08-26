@@ -239,7 +239,7 @@ async function findCustomerByEmail(admin, email) {
   return customer;
 }
 
-async function createCustomerForInvoice(admin, email, companyName) {
+async function createCustomerForInvoice(admin, email, companyName, firstName = "", lastName = "") {
   const cleanEmail = cleanEmailLike(email);
   if (!cleanEmail) return null;
 
@@ -260,8 +260,8 @@ async function createCustomerForInvoice(admin, email, companyName) {
   const data = await graphQL(admin, mutation, {
     input: {
       email: cleanEmail,
-      firstName: "Invoice",
-      lastName: "Customer",
+      ...(clean(firstName) ? { firstName: clean(firstName) } : {}),
+      ...(clean(lastName) ? { lastName: clean(lastName) } : {}),
       note: companyName
         ? `Invoice request reverse charge - ${companyName}`
         : "Invoice request reverse charge",
@@ -288,10 +288,10 @@ async function createCustomerForInvoice(admin, email, companyName) {
   return customer;
 }
 
-async function findOrCreateCustomerByEmail(admin, email, companyName) {
+async function findOrCreateCustomerByEmail(admin, email, companyName, firstName = "", lastName = "") {
   const existing = await findCustomerByEmail(admin, email);
   if (existing?.id) return existing;
-  return createCustomerForInvoice(admin, email, companyName);
+  return createCustomerForInvoice(admin, email, companyName, firstName, lastName);
 }
 
 async function applyReverseCharge(admin, customerGid) {
@@ -520,7 +520,13 @@ export async function action({ request }) {
         taxExemptCustomerPrepared = taxExemptApplied;
         preparedCustomerGid = customerGid;
       } else if (reverseCharge && customerEmail) {
-        const customerByEmail = await findOrCreateCustomerByEmail(admin, customerEmail, companyName);
+        const customerByEmail = await findOrCreateCustomerByEmail(
+          admin,
+          customerEmail,
+          companyName,
+          firstName,
+          lastName,
+        );
         preparedCustomerGid = customerByEmail?.id || "";
 
         if (preparedCustomerGid) {
