@@ -1027,6 +1027,73 @@ async function assignOrderingRole(admin, company, companyContact, locationId) {
   });
 }
 
+async function updateInvoiceCompanyNames(admin, companyId, locationId, companyName) {
+  const realName = clean(companyName);
+  if (!companyId || !realName) return;
+
+  const companyMutation = `#graphql
+    mutation UpdateInvoiceCompanyName($companyId: ID!, $input: CompanyInput!) {
+      companyUpdate(companyId: $companyId, input: $input) {
+        company { id name externalId }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const companyResponse = await admin.graphql(companyMutation, {
+    variables: {
+      companyId,
+      input: { name: realName },
+    },
+  });
+  const companyData = await companyResponse.json();
+  if (companyData?.errors?.length) {
+    throw new Error(companyData.errors.map((error) => error.message).join(" | "));
+  }
+  const companyErrors = companyData?.data?.companyUpdate?.userErrors || [];
+  if (companyErrors.length) {
+    throw new Error(companyErrors.map((error) => error.message).join(" | "));
+  }
+
+  if (locationId) {
+    const locationMutation = `#graphql
+      mutation UpdateInvoiceCompanyLocationName(
+        $companyLocationId: ID!,
+        $input: CompanyLocationUpdateInput!
+      ) {
+        companyLocationUpdate(
+          companyLocationId: $companyLocationId,
+          input: $input
+        ) {
+          companyLocation { id name }
+          userErrors { field message }
+        }
+      }
+    `;
+
+    const locationResponse = await admin.graphql(locationMutation, {
+      variables: {
+        companyLocationId: locationId,
+        input: { name: realName },
+      },
+    });
+    const locationData = await locationResponse.json();
+    if (locationData?.errors?.length) {
+      throw new Error(locationData.errors.map((error) => error.message).join(" | "));
+    }
+    const locationErrors = locationData?.data?.companyLocationUpdate?.userErrors || [];
+    if (locationErrors.length) {
+      throw new Error(locationErrors.map((error) => error.message).join(" | "));
+    }
+  }
+
+  console.log("[orders/create] Invoice company renamed from checkout data", {
+    companyId,
+    locationId,
+    companyName: realName,
+  });
+}
+
 async function setInvoiceCompanyMetafields(admin, ownerIds, fields) {
   const ids = (ownerIds || []).filter(Boolean);
   if (!ids.length) return;
@@ -1126,6 +1193,10 @@ async function ensureInvoiceCompany(admin, {
 
   const locationId = company.locations?.nodes?.[0]?.id || "";
   if (!locationId) throw new Error("Invoice Company has no Company Location");
+
+  // A pre-checkout Company can have a technical placeholder name (invoice-VAT).
+  // Once the order exists, replace it with the real company name from billing/shipping.
+  await updateInvoiceCompanyNames(admin, company.id, locationId, companyName);
 
   await assignOrderingRole(admin, company, companyContact, locationId);
   await applyCompanyTaxSettings(admin, locationId, vatNumber, reverseCharge);
