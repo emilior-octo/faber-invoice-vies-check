@@ -738,6 +738,8 @@ async function findCompanyForInvoice(admin, customerGid, companyName, vatNumber)
               locations(first: 10) {
                 nodes { id name }
               }
+              defaultRole { id name }
+              contactRoles(first: 10) { nodes { id name } }
             }
           }
         }
@@ -765,6 +767,8 @@ async function findCompanyForInvoice(admin, customerGid, companyName, vatNumber)
             name
             externalId
             locations(first: 10) { nodes { id name } }
+            defaultRole { id name }
+            contactRoles(first: 10) { nodes { id name } }
           }
         }
       }
@@ -786,6 +790,8 @@ async function findCompanyForInvoice(admin, customerGid, companyName, vatNumber)
             name
             externalId
             locations(first: 10) { nodes { id name } }
+            defaultRole { id name }
+            contactRoles(first: 10) { nodes { id name } }
           }
         }
       }
@@ -832,6 +838,8 @@ async function createCompanyForInvoice(admin, {
           name
           externalId
           locations(first: 10) { nodes { id name } }
+          defaultRole { id name }
+          contactRoles(first: 10) { nodes { id name } }
         }
         userErrors { field message code }
       }
@@ -857,13 +865,58 @@ async function createCompanyForInvoice(admin, {
   return data?.data?.companyCreate?.company || null;
 }
 
+async function getCompanyContactForCustomer(admin, companyId, customerGid) {
+  if (!companyId || !customerGid) return null;
+
+  const response = await admin.graphql(`#graphql
+    query InvoiceCompanyContact($companyId: ID!) {
+      company(id: $companyId) {
+        contacts(first: 100) {
+          nodes {
+            id
+            customer { id }
+            roleAssignments(first: 50) {
+              nodes {
+                id
+                companyLocation { id }
+                role { id name }
+              }
+            }
+          }
+        }
+      }
+    }
+  `, { variables: { companyId } });
+
+  const data = await response.json();
+  if (data?.errors?.length) throw new Error(data.errors.map((error) => error.message).join(" | "));
+
+  return (data?.data?.company?.contacts?.nodes || []).find(
+    (contact) => contact?.customer?.id === customerGid,
+  ) || null;
+}
+
 async function assignCustomerToCompany(admin, companyId, customerGid) {
-  if (!companyId || !customerGid) return;
+  if (!companyId || !customerGid) return null;
+
+  // Idempotency: an already-associated Customer must still receive a role below.
+  const existingContact = await getCompanyContactForCustomer(admin, companyId, customerGid);
+  if (existingContact?.id) return existingContact;
 
   const mutation = `#graphql
     mutation AssignInvoiceCustomerToCompany($companyId: ID!, $customerId: ID!) {
       companyAssignCustomerAsContact(companyId: $companyId, customerId: $customerId) {
-        companyContact { id }
+        companyContact {
+          id
+          customer { id }
+          roleAssignments(first: 50) {
+            nodes {
+              id
+              companyLocation { id }
+              role { id name }
+            }
+          }
+        }
         userErrors { field message }
       }
     }
@@ -877,7 +930,101 @@ async function assignCustomerToCompany(admin, companyId, customerGid) {
   if (errors.length) {
     const message = errors.map((error) => error.message).join(" | ");
     if (!/already|contact/i.test(message)) throw new Error(message);
+
+    // Shopify can report an already-existing association instead of returning it.
+    return await getCompanyContactForCustomer(admin, companyId, customerGid);
   }
+
+  return data?.data?.companyAssignCustomerAsContact?.companyContact || null;
+}
+
+function findOrderingRole(company) {
+  const roles = company?.contactRoles?.nodes || [];
+
+  // Shopify system role names are currently "Ordering only" / "Location admin".
+  // API docs also use "buyer" / "admin" as examples, so support both forms.
+  const orderingRole = roles.find((role) => {
+    const name = clean(role?.name).toLowerCase();
+    return name === "buyer" || name === "ordering only" || name.includes("ordering");
+  });
+
+  if (orderingRole?.id) return orderingRole;
+
+  // Never silently grant an admin role. Use default only when it is clearly a buyer role.
+  const defaultName = clean(company?.defaultRole?.name).toLowerCase();
+  if (
+    company?.defaultRole?.id &&
+    (defaultName === "buyer" || defaultName === "ordering only" || defaultName.includes("ordering"))
+  ) {
+    return company.defaultRole;
+  }
+
+  return null;
+}
+
+async function assignOrderingRole(admin, company, companyContact, locationId) {
+  if (!company?.id || !companyContact?.id || !locationId) {
+    throw new Error("Missing Company/Contact/Location while assigning B2B ordering role");
+  }
+
+  const alreadyAssigned = (companyContact?.roleAssignments?.nodes || []).some(
+    (assignment) => assignment?.companyLocation?.id === locationId && (() => {
+      const roleName = clean(assignment?.role?.name).toLowerCase();
+      return roleName === "buyer" || roleName === "ordering only" || roleName.includes("ordering");
+    })(),
+  );
+
+  if (alreadyAssigned) return;
+
+  const orderingRole = findOrderingRole(company);
+  if (!orderingRole?.id) {
+    throw new Error(
+      `Ordering-only CompanyContactRole not found for company ${company.id}; refusing to grant an admin role`,
+    );
+  }
+
+  const mutation = `#graphql
+    mutation AssignInvoiceOrderingRole(
+      $companyContactId: ID!,
+      $companyContactRoleId: ID!,
+      $companyLocationId: ID!
+    ) {
+      companyContactAssignRole(
+        companyContactId: $companyContactId,
+        companyContactRoleId: $companyContactRoleId,
+        companyLocationId: $companyLocationId
+      ) {
+        companyContactRoleAssignment {
+          id
+          companyLocation { id }
+          role { id name }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const response = await admin.graphql(mutation, {
+    variables: {
+      companyContactId: companyContact.id,
+      companyContactRoleId: orderingRole.id,
+      companyLocationId: locationId,
+    },
+  });
+  const data = await response.json();
+  const errors = data?.data?.companyContactAssignRole?.userErrors || [];
+  if (errors.length) {
+    const message = errors.map((error) => error.message).join(" | ");
+    if (!/already|assigned/i.test(message)) throw new Error(message);
+  }
+
+  console.log("[orders/create] B2B ordering role ensured", {
+    companyId: company.id,
+    companyContactId: companyContact.id,
+    companyLocationId: locationId,
+    roleId: orderingRole.id,
+    roleName: orderingRole.name,
+  });
 }
 
 async function setInvoiceCompanyMetafields(admin, ownerIds, fields) {
@@ -975,12 +1122,13 @@ async function ensureInvoiceCompany(admin, {
   }
   if (!company?.id) throw new Error("Company creation returned no company ID");
 
-  await assignCustomerToCompany(admin, company.id, customerGid);
+  const companyContact = await assignCustomerToCompany(admin, company.id, customerGid);
 
   const locationId = company.locations?.nodes?.[0]?.id || "";
-  if (locationId) {
-    await applyCompanyTaxSettings(admin, locationId, vatNumber, reverseCharge);
-  }
+  if (!locationId) throw new Error("Invoice Company has no Company Location");
+
+  await assignOrderingRole(admin, company, companyContact, locationId);
+  await applyCompanyTaxSettings(admin, locationId, vatNumber, reverseCharge);
 
   await setInvoiceCompanyMetafields(admin, [company.id, locationId], {
     invoice_type: "company",
