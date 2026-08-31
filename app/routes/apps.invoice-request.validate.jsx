@@ -447,6 +447,10 @@ async function createPreCheckoutCompany(admin, {
       },
       companyLocation: {
         name: resolvedName,
+        buyerExperienceConfiguration: {
+          editableShippingAddress: true,
+          checkoutToDraft: false,
+        },
       },
     },
   });
@@ -488,6 +492,10 @@ async function createPreCheckoutCompanyLocation(admin, companyId, companyName, v
     companyId,
     input: {
       name: resolvedName,
+      buyerExperienceConfiguration: {
+        editableShippingAddress: true,
+        checkoutToDraft: false,
+      },
     },
   });
 
@@ -500,6 +508,61 @@ async function createPreCheckoutCompanyLocation(admin, companyId, companyName, v
   if (!location?.id) throw new Error("Creazione Company Location non riuscita");
 
   return location;
+}
+
+async function ensureCompanyLocationCheckoutDefaults(admin, locationId) {
+  if (!locationId) {
+    return {
+      updated: false,
+      warning: "Company Location mancante per le impostazioni checkout.",
+    };
+  }
+
+  const mutation = `#graphql
+    mutation EnsureInvoiceCompanyCheckoutDefaults(
+      $companyLocationId: ID!,
+      $input: CompanyLocationUpdateInput!
+    ) {
+      companyLocationUpdate(
+        companyLocationId: $companyLocationId,
+        input: $input
+      ) {
+        companyLocation {
+          id
+          buyerExperienceConfiguration {
+            editableShippingAddress
+            checkoutToDraft
+          }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const data = await graphQL(admin, mutation, {
+    companyLocationId: locationId,
+    input: {
+      buyerExperienceConfiguration: {
+        // Screenshot/default requested:
+        // - allow one-time shipping addresses
+        // - submit orders automatically (NOT draft orders)
+        editableShippingAddress: true,
+        checkoutToDraft: false,
+      },
+    },
+  });
+
+  const errors = data?.data?.companyLocationUpdate?.userErrors || [];
+  if (errors.length) {
+    throw new Error(errors.map((error) => error.message).join(" | "));
+  }
+
+  return {
+    updated: true,
+    configuration:
+      data?.data?.companyLocationUpdate?.companyLocation?.buyerExperienceConfiguration ||
+      null,
+  };
 }
 
 async function getCustomerCompanyContactProfiles(admin, customerGid) {
@@ -882,6 +945,7 @@ function emptyCompanyPreflight(overrides = {}) {
     contactCreated: false,
     orderingRoleAssigned: false,
     purchasePermissionReady: false,
+    checkoutDefaultsReady: true,
     requiresB2BContextRefresh: false,
     syncRequired: false,
     syncReason: "",
@@ -1089,6 +1153,27 @@ async function ensurePreCheckoutInvoiceCompany(admin, {
 
   state.companyId = company.id;
   state.companyLocationId = location.id;
+
+  // Keep every invoice-created/reused B2B location on the storefront checkout:
+  // - one-time shipping address allowed
+  // - order submitted automatically, not as a draft
+  // This also preserves normal checkout discount-code behaviour.
+  try {
+    await ensureCompanyLocationCheckoutDefaults(admin, location.id);
+  } catch (error) {
+    state.checkoutDefaultsReady = false;
+    state.syncRequired = true;
+    state.syncReason =
+      state.syncReason ||
+      `Impostazioni checkout sede da riconciliare: ${error?.message || error}`;
+    state.warnings.push(`Checkout settings: ${error?.message || error}`);
+
+    console.warn("[Invoice Request] Company Location checkout defaults deferred", {
+      companyId: company.id,
+      locationId: location.id,
+      error: error?.message || String(error),
+    });
+  }
 
   // VAT native + fiscal metadata are useful even if a later contact/role step
   // needs manual reconciliation. Failure here is recorded, but never blocks checkout.
