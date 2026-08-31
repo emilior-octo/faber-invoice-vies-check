@@ -362,23 +362,19 @@ async function findCompaniesByExactVat(admin, vatNumber) {
     const companies = connection?.nodes || [];
 
     for (const company of companies) {
-      const exactLocations = (company?.locations?.nodes || []).filter(
+      const locations = company?.locations?.nodes || [];
+      const nativeExactLocations = locations.filter(
         (location) =>
           normalizeVatForCompany(location?.taxSettings?.taxRegistrationId) === wantedVat,
       );
+      const externalExact = clean(company?.externalId) === wantedExternalId;
 
-      const exactExternalId = clean(company?.externalId) === wantedExternalId;
-
-      if (exactLocations.length || exactExternalId) {
-        const location =
-          exactLocations[0] ||
-          company?.locations?.nodes?.[0] ||
-          null;
-
+      if (nativeExactLocations.length || externalExact) {
         matchesById.set(company.id, {
           company,
-          location,
-          matchedBy: exactLocations.length ? "taxRegistrationId" : "externalId",
+          locations,
+          nativeExactLocations,
+          externalExact,
         });
       }
     }
@@ -395,8 +391,10 @@ async function findCompaniesByExactVat(admin, vatNumber) {
     matches: matches.map((match) => ({
       companyId: match.company?.id,
       companyName: match.company?.name,
-      locationId: match.location?.id,
-      matchedBy: match.matchedBy,
+      externalId: match.company?.externalId,
+      nativeExactLocationIds: match.nativeExactLocations.map((location) => location.id),
+      externalExact: match.externalExact,
+      locationCount: match.locations.length,
     })),
   });
 
@@ -464,22 +462,64 @@ async function createPreCheckoutCompany(admin, {
   return company;
 }
 
-async function getCompanyContactForCustomer(admin, companyId, customerGid) {
-  if (!companyId || !customerGid) return null;
+async function createPreCheckoutCompanyLocation(admin, companyId, companyName, vatNumber) {
+  if (!companyId) throw new Error("Company ID mancante per creazione sede");
+
+  const resolvedName = clean(companyName) || temporaryCompanyName(vatNumber);
+
+  const mutation = `#graphql
+    mutation CreateInvoiceCompanyLocation($companyId: ID!, $input: CompanyLocationInput!) {
+      companyLocationCreate(companyId: $companyId, input: $input) {
+        companyLocation {
+          id
+          name
+          taxSettings {
+            taxRegistrationId
+            taxExempt
+            taxExemptions
+          }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const data = await graphQL(admin, mutation, {
+    companyId,
+    input: {
+      name: resolvedName,
+    },
+  });
+
+  const errors = data?.data?.companyLocationCreate?.userErrors || [];
+  if (errors.length) {
+    throw new Error(errors.map((error) => error.message).join(" | "));
+  }
+
+  const location = data?.data?.companyLocationCreate?.companyLocation || null;
+  if (!location?.id) throw new Error("Creazione Company Location non riuscita");
+
+  return location;
+}
+
+async function getCustomerCompanyContactProfiles(admin, customerGid) {
+  if (!customerGid) return [];
 
   const query = `#graphql
-    query InvoicePreCheckoutCompanyContact($companyId: ID!) {
-      company(id: $companyId) {
-        contacts(first: 100) {
-          nodes {
+    query InvoiceCustomerCompanyContactProfiles($customerId: ID!) {
+      customer(id: $customerId) {
+        id
+        companyContactProfiles {
+          id
+          company {
             id
-            customer { id }
-            roleAssignments(first: 50) {
-              nodes {
-                id
-                companyLocation { id }
-                role { id name }
-              }
+            name
+          }
+          roleAssignments(first: 100) {
+            nodes {
+              id
+              companyLocation { id }
+              role { id name }
             }
           }
         }
@@ -487,16 +527,51 @@ async function getCompanyContactForCustomer(admin, companyId, customerGid) {
     }
   `;
 
-  const data = await graphQL(admin, query, { companyId });
-  return (data?.data?.company?.contacts?.nodes || []).find(
-    (contact) => contact?.customer?.id === customerGid,
-  ) || null;
+  const data = await graphQL(admin, query, { customerId: customerGid });
+  return data?.data?.customer?.companyContactProfiles || [];
+}
+
+async function getCompanyContactForCustomer(admin, companyId, customerGid) {
+  if (!companyId || !customerGid) return null;
+
+  const profiles = await getCustomerCompanyContactProfiles(admin, customerGid);
+  const matches = profiles.filter((profile) => profile?.company?.id === companyId);
+
+  if (matches.length === 1) return matches[0];
+  if (matches.length > 1) {
+    console.warn("[Invoice Request] multiple CompanyContact profiles for same Company", {
+      customerGid,
+      companyId,
+      companyContactIds: matches.map((profile) => profile.id),
+    });
+  }
+
+  return matches[0] || null;
 }
 
 async function assignCustomerToPreCheckoutCompany(admin, companyId, customerGid) {
-  const existing = await getCompanyContactForCustomer(admin, companyId, customerGid);
-  if (existing?.id) {
-    return { companyContact: existing, created: false };
+  const profilesBefore = await getCustomerCompanyContactProfiles(admin, customerGid);
+  const targetProfilesBefore = profilesBefore.filter(
+    (profile) => profile?.company?.id === companyId,
+  );
+
+  if (targetProfilesBefore.length === 1) {
+    return {
+      companyContact: targetProfilesBefore[0],
+      created: false,
+      alreadyAssociated: true,
+      ambiguous: false,
+    };
+  }
+
+  if (targetProfilesBefore.length > 1) {
+    return {
+      companyContact: null,
+      created: false,
+      alreadyAssociated: true,
+      ambiguous: true,
+      warning: `Più CompanyContact trovati per Customer ${customerGid} e Company ${companyId}.`,
+    };
   }
 
   const mutation = `#graphql
@@ -505,7 +580,8 @@ async function assignCustomerToPreCheckoutCompany(admin, companyId, customerGid)
         companyContact {
           id
           customer { id }
-          roleAssignments(first: 50) {
+          company { id name }
+          roleAssignments(first: 100) {
             nodes {
               id
               companyLocation { id }
@@ -518,23 +594,53 @@ async function assignCustomerToPreCheckoutCompany(admin, companyId, customerGid)
     }
   `;
 
-  const data = await graphQL(admin, mutation, { companyId, customerId: customerGid });
+  const data = await graphQL(admin, mutation, {
+    companyId,
+    customerId: customerGid,
+  });
+
   const errors = data?.data?.companyAssignCustomerAsContact?.userErrors || [];
-
-  if (errors.length) {
-    const message = errors.map((error) => error.message).join(" | ");
-    if (!/already|contact/i.test(message)) throw new Error(message);
-
-    const recovered = await getCompanyContactForCustomer(admin, companyId, customerGid);
-    if (!recovered?.id) throw new Error(message);
-
-    return { companyContact: recovered, created: false };
+  if (!errors.length) {
+    return {
+      companyContact: data?.data?.companyAssignCustomerAsContact?.companyContact || null,
+      created: true,
+      alreadyAssociated: false,
+      ambiguous: false,
+    };
   }
 
-  return {
-    companyContact: data?.data?.companyAssignCustomerAsContact?.companyContact || null,
-    created: true,
-  };
+  const message = errors.map((error) => error.message).join(" | ");
+
+  // Shopify can answer "already associated" even when our Company-side lookup did not
+  // expose the contact. Re-read the Customer globally before deciding this needs manual sync.
+  if (/already|associated|contact/i.test(message)) {
+    const profilesAfter = await getCustomerCompanyContactProfiles(admin, customerGid);
+    const targetProfilesAfter = profilesAfter.filter(
+      (profile) => profile?.company?.id === companyId,
+    );
+
+    if (targetProfilesAfter.length === 1) {
+      return {
+        companyContact: targetProfilesAfter[0],
+        created: false,
+        alreadyAssociated: true,
+        ambiguous: false,
+      };
+    }
+
+    return {
+      companyContact: null,
+      created: false,
+      alreadyAssociated: profilesAfter.length > 0,
+      ambiguous: targetProfilesAfter.length > 1,
+      warning: message,
+      otherCompanyIds: profilesAfter
+        .map((profile) => profile?.company?.id)
+        .filter(Boolean),
+    };
+  }
+
+  throw new Error(message);
 }
 
 function findOrderingRole(company) {
@@ -549,7 +655,9 @@ function findOrderingRole(company) {
   const defaultName = clean(company?.defaultRole?.name).toLowerCase();
   if (
     company?.defaultRole?.id &&
-    (defaultName === "buyer" || defaultName === "ordering only" || defaultName.includes("ordering"))
+    (defaultName === "buyer" ||
+      defaultName === "ordering only" ||
+      defaultName.includes("ordering"))
   ) {
     return company.defaultRole;
   }
@@ -557,19 +665,32 @@ function findOrderingRole(company) {
   return null;
 }
 
+function hasPurchasingPermission(companyContact, locationId) {
+  return (companyContact?.roleAssignments?.nodes || []).some((assignment) => {
+    if (assignment?.companyLocation?.id !== locationId) return false;
+
+    const roleName = clean(assignment?.role?.name).toLowerCase();
+
+    return (
+      roleName === "buyer" ||
+      roleName === "ordering only" ||
+      roleName.includes("ordering") ||
+      roleName.includes("location admin") ||
+      roleName === "admin"
+    );
+  });
+}
+
 async function assignPreCheckoutOrderingRole(admin, company, companyContact, locationId) {
   if (!company?.id || !companyContact?.id || !locationId) {
     throw new Error("Company/Contact/Location mancanti durante autorizzazione B2B");
   }
 
-  const alreadyAssigned = (companyContact?.roleAssignments?.nodes || []).some((assignment) => {
-    if (assignment?.companyLocation?.id !== locationId) return false;
-    const roleName = clean(assignment?.role?.name).toLowerCase();
-    return roleName === "buyer" || roleName === "ordering only" || roleName.includes("ordering");
-  });
-
-  if (alreadyAssigned) {
-    return { assigned: false };
+  if (hasPurchasingPermission(companyContact, locationId)) {
+    return {
+      assigned: false,
+      alreadyAllowed: true,
+    };
   }
 
   const orderingRole = findOrderingRole(company);
@@ -603,11 +724,21 @@ async function assignPreCheckoutOrderingRole(admin, company, companyContact, loc
   const errors = data?.data?.companyContactAssignRole?.userErrors || [];
   if (errors.length) {
     const message = errors.map((error) => error.message).join(" | ");
-    if (!/already|assigned/i.test(message)) throw new Error(message);
-    return { assigned: false };
+
+    if (/already|assigned/i.test(message)) {
+      return {
+        assigned: false,
+        alreadyAllowed: true,
+      };
+    }
+
+    throw new Error(message);
   }
 
-  return { assigned: true };
+  return {
+    assigned: true,
+    alreadyAllowed: false,
+  };
 }
 
 async function applyPreCheckoutCompanyTaxSettings(admin, {
@@ -733,9 +864,52 @@ async function setCompanyInvoiceMetafields(admin, {
 
   const data = await graphQL(admin, mutation, { metafields });
   const errors = data?.data?.metafieldsSet?.userErrors || [];
+
   if (errors.length) {
     console.warn("[Invoice Request] Company fiscal metafields warning", { errors });
   }
+}
+
+function emptyCompanyPreflight(overrides = {}) {
+  return {
+    state: "not_started",
+    vatMatch: "",
+    companyId: "",
+    companyLocationId: "",
+    companyContactId: "",
+    companyCreated: false,
+    locationCreated: false,
+    contactCreated: false,
+    orderingRoleAssigned: false,
+    purchasePermissionReady: false,
+    requiresB2BContextRefresh: false,
+    syncRequired: false,
+    syncReason: "",
+    warnings: [],
+    ...overrides,
+  };
+}
+
+function manualCompanyPreflight(state, reason, overrides = {}) {
+  const warningList = [
+    ...(Array.isArray(overrides.warnings) ? overrides.warnings : []),
+    reason,
+  ].filter(Boolean);
+
+  const result = emptyCompanyPreflight({
+    ...overrides,
+    state,
+    syncRequired: true,
+    syncReason: reason,
+    warnings: warningList,
+    // IMPORTANT: manual-sync edge cases must not force the storefront into a
+    // half-prepared B2B purchasing context. Checkout can continue as D2C and
+    // the invoice request remains available for later reconciliation.
+    requiresB2BContextRefresh: false,
+  });
+
+  console.warn("[Invoice Request] B2B preflight deferred to manual sync", result);
+  return result;
 }
 
 async function ensurePreCheckoutInvoiceCompany(admin, {
@@ -745,96 +919,317 @@ async function ensurePreCheckoutInvoiceCompany(admin, {
   pec,
   sdi,
 }) {
-  if (!customerGid) throw new Error("Cliente Shopify mancante durante il preflight B2B");
-  if (!vatNumber) throw new Error("VAT mancante durante il preflight B2B");
+  const wantedVat = normalizeVatForCompany(vatNumber);
+  let state = emptyCompanyPreflight();
 
-  const exactMatches = await findCompaniesByExactVat(admin, vatNumber);
-
-  if (exactMatches.length > 1) {
-    throw new Error(
-      `Trovate ${exactMatches.length} aziende Shopify con VAT ${normalizeVatForCompany(vatNumber)}. Nessuna associazione automatica eseguita.`,
+  if (!customerGid) {
+    return manualCompanyPreflight(
+      "customer_missing",
+      "Cliente Shopify non disponibile per la preparazione B2B.",
+      { vatMatch: wantedVat ? "unresolved" : "" },
     );
   }
 
-  let company;
-  let location;
-  let companyCreated = false;
+  if (!wantedVat) {
+    return manualCompanyPreflight(
+      "vat_missing",
+      "VAT non disponibile per la preparazione B2B.",
+    );
+  }
 
-  if (exactMatches.length === 1) {
-    company = exactMatches[0].company;
-    location = exactMatches[0].location;
+  let exactMatches;
+  try {
+    exactMatches = await findCompaniesByExactVat(admin, wantedVat);
+  } catch (error) {
+    return manualCompanyPreflight(
+      "company_lookup_failed",
+      `Ricerca Company per VAT non riuscita: ${error?.message || error}`,
+    );
+  }
+
+  if (exactMatches.length > 1) {
+    return manualCompanyPreflight(
+      "company_ambiguous",
+      `Trovate ${exactMatches.length} Company con VAT ${wantedVat}; nessuna associazione automatica.`,
+      {
+        vatMatch: "ambiguous",
+        warnings: exactMatches.map(
+          (match) => `Candidate Company: ${match.company?.id || "?"}`,
+        ),
+      },
+    );
+  }
+
+  let company = null;
+  let location = null;
+
+  if (exactMatches.length === 0) {
+    try {
+      company = await createPreCheckoutCompany(admin, {
+        vatNumber: wantedVat,
+        companyName,
+      });
+
+      state.companyCreated = true;
+      state.vatMatch = "created";
+      location = company?.locations?.nodes?.[0] || null;
+
+      if (!location?.id) {
+        location = await createPreCheckoutCompanyLocation(
+          admin,
+          company.id,
+          companyName,
+          wantedVat,
+        );
+        state.locationCreated = true;
+      }
+    } catch (error) {
+      return manualCompanyPreflight(
+        "company_create_failed",
+        `Creazione Company/sede non riuscita: ${error?.message || error}`,
+        {
+          vatMatch: "create_failed",
+          companyId: company?.id || "",
+          companyCreated: Boolean(state.companyCreated),
+        },
+      );
+    }
   } else {
-    company = await createPreCheckoutCompany(admin, {
-      vatNumber,
+    const match = exactMatches[0];
+    company = match.company;
+
+    if (match.nativeExactLocations.length > 1) {
+      return manualCompanyPreflight(
+        "location_ambiguous",
+        `Più sedi della stessa Company hanno VAT ${wantedVat}; scelta automatica evitata.`,
+        {
+          vatMatch: "ambiguous",
+          companyId: company?.id || "",
+          warnings: match.nativeExactLocations.map(
+            (candidate) => `Candidate Location: ${candidate.id}`,
+          ),
+        },
+      );
+    }
+
+    if (match.nativeExactLocations.length === 1) {
+      location = match.nativeExactLocations[0];
+      state.vatMatch = "native_exact";
+    } else if (match.externalExact) {
+      state.vatMatch = "legacy_external_id";
+
+      if (match.locations.length === 0) {
+        try {
+          location = await createPreCheckoutCompanyLocation(
+            admin,
+            company.id,
+            companyName || company.name,
+            wantedVat,
+          );
+          state.locationCreated = true;
+        } catch (error) {
+          return manualCompanyPreflight(
+            "location_create_failed",
+            `Company legacy trovata, ma creazione sede non riuscita: ${error?.message || error}`,
+            {
+              companyId: company?.id || "",
+              vatMatch: state.vatMatch,
+            },
+          );
+        }
+      } else if (match.locations.length === 1) {
+        location = match.locations[0];
+
+        const existingNativeVat = normalizeVatForCompany(
+          location?.taxSettings?.taxRegistrationId,
+        );
+
+        if (existingNativeVat && existingNativeVat !== wantedVat) {
+          return manualCompanyPreflight(
+            "vat_conflict",
+            `Conflitto VAT: externalId indica ${wantedVat}, ma la sede Shopify contiene ${existingNativeVat}.`,
+            {
+              companyId: company?.id || "",
+              companyLocationId: location?.id || "",
+              vatMatch: "conflict",
+            },
+          );
+        }
+      } else {
+        return manualCompanyPreflight(
+          "legacy_location_ambiguous",
+          `Company legacy ${company?.id || ""} ha più sedi e nessuna con VAT nativo esatto ${wantedVat}.`,
+          {
+            companyId: company?.id || "",
+            vatMatch: state.vatMatch,
+          },
+        );
+      }
+    }
+  }
+
+  if (!company?.id) {
+    return manualCompanyPreflight(
+      "company_unresolved",
+      "Company non risolta dopo il matching VAT.",
+      { vatMatch: state.vatMatch || "unresolved" },
+    );
+  }
+
+  if (!location?.id) {
+    return manualCompanyPreflight(
+      "location_unresolved",
+      "Company trovata ma sede B2B non risolta.",
+      {
+        companyId: company.id,
+        vatMatch: state.vatMatch || "unresolved",
+      },
+    );
+  }
+
+  state.companyId = company.id;
+  state.companyLocationId = location.id;
+
+  // VAT native + fiscal metadata are useful even if a later contact/role step
+  // needs manual reconciliation. Failure here is recorded, but never blocks checkout.
+  try {
+    const existingNativeVat = normalizeVatForCompany(
+      location?.taxSettings?.taxRegistrationId,
+    );
+
+    if (!existingNativeVat || existingNativeVat === wantedVat) {
+      await applyPreCheckoutCompanyTaxSettings(admin, {
+        locationId: location.id,
+        vatNumber: wantedVat,
+        reverseCharge: false,
+      });
+    } else {
+      state.syncRequired = true;
+      state.syncReason =
+        `VAT sede ${existingNativeVat} diverso dal VAT richiesto ${wantedVat}.`;
+      state.warnings.push(state.syncReason);
+    }
+  } catch (error) {
+    state.syncRequired = true;
+    state.syncReason =
+      state.syncReason ||
+      `Scrittura VAT nativo non riuscita: ${error?.message || error}`;
+    state.warnings.push(`Tax settings: ${error?.message || error}`);
+  }
+
+  try {
+    await setCompanyInvoiceMetafields(admin, {
+      companyId: company.id,
+      locationId: location.id,
+      vatNumber: wantedVat,
+      pec,
+      sdi,
       companyName,
     });
-    companyCreated = true;
-    location = company?.locations?.nodes?.[0] || null;
+  } catch (error) {
+    state.syncRequired = true;
+    state.syncReason =
+      state.syncReason ||
+      `Salvataggio dati fiscali Company non riuscito: ${error?.message || error}`;
+    state.warnings.push(`Fiscal metafields: ${error?.message || error}`);
   }
 
-  if (!company?.id) throw new Error("Company B2B non disponibile");
-  if (!location?.id) throw new Error("Company B2B senza sede disponibile");
+  let contactResult;
+  try {
+    contactResult = await assignCustomerToPreCheckoutCompany(
+      admin,
+      company.id,
+      customerGid,
+    );
+  } catch (error) {
+    return manualCompanyPreflight(
+      "contact_assign_failed",
+      `Associazione Customer → Company non riuscita: ${error?.message || error}`,
+      {
+        ...state,
+        companyId: company.id,
+        companyLocationId: location.id,
+      },
+    );
+  }
 
-  // Fiscal identity is written before the customer is allowed to buy.
-  // VAT is native Shopify taxRegistrationId; PEC/SDI are persisted as metafields.
-  await applyPreCheckoutCompanyTaxSettings(admin, {
-    locationId: location.id,
-    vatNumber,
-    reverseCharge: false,
-  });
-
-  await setCompanyInvoiceMetafields(admin, {
-    companyId: company.id,
-    locationId: location.id,
-    vatNumber,
-    pec,
-    sdi,
-    companyName,
-  });
-
-  const contactResult = await assignCustomerToPreCheckoutCompany(
-    admin,
-    company.id,
-    customerGid,
-  );
+  if (contactResult?.ambiguous) {
+    return manualCompanyPreflight(
+      "contact_ambiguous",
+      contactResult.warning ||
+        "Più CompanyContact compatibili trovati; associazione automatica evitata.",
+      {
+        ...state,
+        companyId: company.id,
+        companyLocationId: location.id,
+      },
+    );
+  }
 
   const companyContact = contactResult?.companyContact;
+
   if (!companyContact?.id) {
-    throw new Error("Associazione Customer → Company non riuscita");
+    return manualCompanyPreflight(
+      "contact_unresolved",
+      contactResult?.warning ||
+        "Customer già associato a un altro CompanyContact e contatto target non risolvibile automaticamente.",
+      {
+        ...state,
+        companyId: company.id,
+        companyLocationId: location.id,
+        warnings: [
+          ...state.warnings,
+          ...(contactResult?.otherCompanyIds || []).map(
+            (id) => `Customer already linked to Company ${id}`,
+          ),
+        ],
+      },
+    );
   }
 
-  const roleResult = await assignPreCheckoutOrderingRole(
-    admin,
-    company,
-    companyContact,
-    location.id,
-  );
+  state.companyContactId = companyContact.id;
+  state.contactCreated = Boolean(contactResult.created);
 
-  const requiresB2BContextRefresh =
-    companyCreated ||
-    Boolean(contactResult?.created) ||
-    Boolean(roleResult?.assigned);
+  try {
+    const roleResult = await assignPreCheckoutOrderingRole(
+      admin,
+      company,
+      companyContact,
+      location.id,
+    );
 
-  console.log("[Invoice Request] deterministic B2B preflight complete", {
+    state.orderingRoleAssigned = Boolean(roleResult?.assigned);
+    state.purchasePermissionReady =
+      Boolean(roleResult?.alreadyAllowed) ||
+      Boolean(roleResult?.assigned);
+  } catch (error) {
+    return manualCompanyPreflight(
+      "purchase_permission_failed",
+      `Permesso di acquisto sulla sede non confermato: ${error?.message || error}`,
+      {
+        ...state,
+        companyId: company.id,
+        companyLocationId: location.id,
+        companyContactId: companyContact.id,
+      },
+    );
+  }
+
+  state.requiresB2BContextRefresh =
+    state.companyCreated ||
+    state.locationCreated ||
+    state.contactCreated ||
+    state.orderingRoleAssigned;
+
+  state.state = state.syncRequired ? "ready_with_warnings" : "ready";
+
+  console.log("[Invoice Request] resilient B2B preflight complete", {
     customerGid,
-    companyId: company.id,
-    companyName: company.name,
-    companyLocationId: location.id,
-    vatNumber: normalizeVatForCompany(vatNumber),
-    companyCreated,
-    contactCreated: Boolean(contactResult?.created),
-    orderingRoleAssigned: Boolean(roleResult?.assigned),
-    requiresB2BContextRefresh,
+    vatNumber: wantedVat,
+    ...state,
   });
 
-  return {
-    companyId: company.id,
-    companyLocationId: location.id,
-    companyCreated,
-    contactCreated: Boolean(contactResult?.created),
-    orderingRoleAssigned: Boolean(roleResult?.assigned),
-    requiresB2BContextRefresh,
-  };
+  return state;
 }
 
 async function applyReverseCharge(admin, customerGid) {
@@ -987,42 +1382,55 @@ export async function action({ request }) {
   let preparedCustomerGid = customerGid;
   let companyPreflight = null;
 
+  const companySyncRequired = () => Boolean(companyPreflight?.syncRequired);
+  const companySyncReason = () => clean(companyPreflight?.syncReason);
+
   try {
     // BUSINESS PRE-CHECKOUT PREPARATION:
     // Create/find the Shopify Customer and make it an authorized B2B buyer BEFORE
     // Shopify creates the order. This is what lets checkout use the Company purchasing context.
     if (invoiceType === "company") {
-      if (!preparedCustomerGid) {
-        if (!customerEmail) {
-          throw new Error(
-            locale === "it"
-              ? "Per la fattura aziendale serve un cliente Shopify identificabile. Accedi oppure inserisci l'email."
-              : "A Shopify customer is required for a company invoice. Sign in or provide the email.",
+      try {
+        if (!preparedCustomerGid && customerEmail) {
+          const customerByEmail = await findOrCreateCustomerByEmail(
+            admin,
+            customerEmail,
+            companyName,
+            firstName,
+            lastName,
           );
+
+          preparedCustomerGid = customerByEmail?.id || "";
         }
-
-        const customerByEmail = await findOrCreateCustomerByEmail(
-          admin,
-          customerEmail,
-          companyName,
-          firstName,
-          lastName,
-        );
-
-        preparedCustomerGid = customerByEmail?.id || "";
 
         if (!preparedCustomerGid) {
-          throw new Error("Creazione cliente Shopify non riuscita");
+          companyPreflight = manualCompanyPreflight(
+            "customer_unresolved",
+            "Cliente Shopify non risolto automaticamente. La richiesta fattura viene comunque registrata per la riconciliazione.",
+            { vatMatch: fullVatNumber ? "unresolved" : "" },
+          );
+        } else {
+          companyPreflight = await ensurePreCheckoutInvoiceCompany(admin, {
+            customerGid: preparedCustomerGid,
+            vatNumber: fullVatNumber,
+            companyName,
+            pec,
+            sdi,
+          });
         }
+      } catch (error) {
+        // B2B enrichment must NEVER be the reason an order cannot proceed.
+        // We already know the invoice fiscal data from the form, so keep it and
+        // mark the request for reconciliation after the order.
+        companyPreflight = manualCompanyPreflight(
+          "preflight_unexpected_error",
+          `Preparazione B2B rinviata: ${error?.message || error}`,
+          {
+            companyId: companyPreflight?.companyId || "",
+            companyLocationId: companyPreflight?.companyLocationId || "",
+          },
+        );
       }
-
-      companyPreflight = await ensurePreCheckoutInvoiceCompany(admin, {
-        customerGid: preparedCustomerGid,
-        vatNumber: fullVatNumber,
-        companyName,
-        pec,
-        sdi,
-      });
 
       mustUseSameEmailAtCheckout = Boolean(customerEmail);
     }
@@ -1091,13 +1499,24 @@ export async function action({ request }) {
           pendingManualReview: true,
           reviewRequired: true,
           viesTechnicalError: false,
+          companySyncRequired: companySyncRequired(),
+          companySyncReason: companySyncReason(),
+          companyPreflightState: companyPreflight?.state || "",
+          vatMatch: companyPreflight?.vatMatch || "",
+          companyContactId: companyPreflight?.companyContactId || "",
+          locationCreated: Boolean(companyPreflight?.locationCreated),
+          purchasePermissionReady: Boolean(companyPreflight?.purchasePermissionReady),
+          companyWarnings: companyPreflight?.warnings || [],
           customerEmail,
           customerId: preparedCustomerGid || customerGid || customerId || "",
           companyPrepared: Boolean(companyPreflight?.companyId),
           companyId: companyPreflight?.companyId || "",
           companyLocationId: companyPreflight?.companyLocationId || "",
+          companyContactId: companyPreflight?.companyContactId || "",
           companyCreated: Boolean(companyPreflight?.companyCreated),
+          locationCreated: Boolean(companyPreflight?.locationCreated),
           contactCreated: Boolean(companyPreflight?.contactCreated),
+          purchasePermissionReady: Boolean(companyPreflight?.purchasePermissionReady),
           orderingRoleAssigned: Boolean(companyPreflight?.orderingRoleAssigned),
           requiresB2BContextRefresh: Boolean(companyPreflight?.requiresB2BContextRefresh),
           message: errorMessage,
@@ -1105,28 +1524,75 @@ export async function action({ request }) {
       }
 
       if (reverseCharge && preparedCustomerGid) {
-        const taxExemptResult = await applyReverseCharge(admin, preparedCustomerGid);
-        taxExemptApplied = Boolean(taxExemptResult.applied);
-        taxExemptCustomerPrepared = taxExemptApplied;
-        mustUseSameEmailAtCheckout = Boolean(customerEmail) || mustUseSameEmailAtCheckout;
+        try {
+          const taxExemptResult = await applyReverseCharge(admin, preparedCustomerGid);
+          taxExemptApplied = Boolean(taxExemptResult.applied);
+          taxExemptCustomerPrepared = taxExemptApplied;
+        } catch (error) {
+          taxExemptApplied = false;
+          taxExemptCustomerPrepared = false;
+
+          companyPreflight = companyPreflight || emptyCompanyPreflight();
+          companyPreflight.syncRequired = true;
+          companyPreflight.syncReason =
+            companyPreflight.syncReason ||
+            `Reverse charge da riconciliare: ${error?.message || error}`;
+          companyPreflight.warnings = [
+            ...(companyPreflight.warnings || []),
+            `Reverse charge customer update: ${error?.message || error}`,
+          ];
+
+          console.warn("[Invoice Request] reverse charge deferred; checkout remains allowed", {
+            customerGid: preparedCustomerGid,
+            error: error?.message || String(error),
+          });
+        }
+
+        mustUseSameEmailAtCheckout =
+          Boolean(customerEmail) || mustUseSameEmailAtCheckout;
       } else if (reverseCharge && !preparedCustomerGid) {
         requiresLoginForTaxExemption = true;
+
+        companyPreflight = companyPreflight || emptyCompanyPreflight();
+        companyPreflight.syncRequired = true;
+        companyPreflight.syncReason =
+          companyPreflight.syncReason ||
+          "Reverse charge da riconciliare perché il Customer Shopify non è disponibile.";
       }
     }
 
     if (preparedCustomerGid) {
-      await setCustomerMetafields(admin, preparedCustomerGid, {
-        invoice_type: invoiceType,
-        fiscal_code: fiscalCode,
-        vat_number: fullVatNumber,
-        invoice_country_code: countryCode,
-        pec,
-        sdi,
-        company_name: companyName,
-        vies_checked: String(viesChecked),
-        vies_valid: viesValid === null ? "" : String(viesValid),
-        reverse_charge: String(reverseCharge),
-      });
+      try {
+        await setCustomerMetafields(admin, preparedCustomerGid, {
+          invoice_type: invoiceType,
+          fiscal_code: fiscalCode,
+          vat_number: fullVatNumber,
+          invoice_country_code: countryCode,
+          pec,
+          sdi,
+          company_name: companyName,
+          vies_checked: String(viesChecked),
+          vies_valid: viesValid === null ? "" : String(viesValid),
+          reverse_charge: String(reverseCharge),
+        });
+      } catch (error) {
+        console.warn("[Invoice Request] customer fiscal metafields deferred", {
+          customerGid: preparedCustomerGid,
+          error: error?.message || String(error),
+        });
+
+        if (invoiceType === "company") {
+          companyPreflight = companyPreflight || emptyCompanyPreflight();
+          companyPreflight.syncRequired = true;
+          companyPreflight.syncReason =
+            companyPreflight.syncReason ||
+            `Metafield cliente da riconciliare: ${error?.message || error}`;
+          companyPreflight.warnings = [
+            ...(companyPreflight.warnings || []),
+            `Customer metafields: ${error?.message || error}`,
+          ];
+        }
+      }
     }
 
     const invoiceRequest = await createOrUpdateInvoiceRequest({
@@ -1151,12 +1617,21 @@ export async function action({ request }) {
         viesRawResponse: viesRawResponse ? JSON.stringify(viesRawResponse) : null,
         reverseCharge,
         taxExemptApplied,
-        status: viesUnavailable ? "pending_review" : invoiceType === "private" ? "registered" : "validated",
-        errorMessage: viesUnavailable
-          ? `Errore tecnico VIES: ${viesRawResponse?.errorCode || "VIES_UNAVAILABLE"}${viesRawResponse?.errorMessage ? ` - ${viesRawResponse.errorMessage}` : ""}`
-          : taxExemptApplied || taxExemptCustomerPrepared || !reverseCharge
-            ? null
-            : "VIES valido, ma reverse charge non confermato sul cliente Shopify.",
+        status:
+          viesUnavailable || companySyncRequired()
+            ? "pending_review"
+            : invoiceType === "private"
+              ? "registered"
+              : "validated",
+        errorMessage: [
+          viesUnavailable
+            ? `Errore tecnico VIES: ${viesRawResponse?.errorCode || "VIES_UNAVAILABLE"}${viesRawResponse?.errorMessage ? ` - ${viesRawResponse.errorMessage}` : ""}`
+            : "",
+          companySyncReason(),
+          reverseCharge && !taxExemptApplied && !taxExemptCustomerPrepared
+            ? "VIES valido, ma reverse charge non confermato sul cliente Shopify."
+            : "",
+        ].filter(Boolean).join(" | ") || null,
       },
     });
 
@@ -1171,9 +1646,17 @@ export async function action({ request }) {
       taxExemptApplied,
       viesUnavailable,
       viesTechnicalError: viesUnavailable,
-      pendingManualReview: viesUnavailable,
+      pendingManualReview: viesUnavailable || companySyncRequired(),
       taxExemptCustomerPrepared,
-      reviewRequired: viesUnavailable,
+      reviewRequired: viesUnavailable || companySyncRequired(),
+      companySyncRequired: companySyncRequired(),
+      companySyncReason: companySyncReason(),
+      companyPreflightState: companyPreflight?.state || "",
+      vatMatch: companyPreflight?.vatMatch || "",
+      companyContactId: companyPreflight?.companyContactId || "",
+      locationCreated: Boolean(companyPreflight?.locationCreated),
+      purchasePermissionReady: Boolean(companyPreflight?.purchasePermissionReady),
+      companyWarnings: companyPreflight?.warnings || [],
       viesErrorCode: viesRawResponse?.errorCode || "",
       mustUseSameEmailAtCheckout,
       requiresLoginForTaxExemption,
@@ -1182,8 +1665,11 @@ export async function action({ request }) {
       companyPrepared: Boolean(companyPreflight?.companyId),
       companyId: companyPreflight?.companyId || "",
       companyLocationId: companyPreflight?.companyLocationId || "",
+      companyContactId: companyPreflight?.companyContactId || "",
       companyCreated: Boolean(companyPreflight?.companyCreated),
+      locationCreated: Boolean(companyPreflight?.locationCreated),
       contactCreated: Boolean(companyPreflight?.contactCreated),
+      purchasePermissionReady: Boolean(companyPreflight?.purchasePermissionReady),
       orderingRoleAssigned: Boolean(companyPreflight?.orderingRoleAssigned),
       requiresB2BContextRefresh: Boolean(companyPreflight?.requiresB2BContextRefresh),
       message: reverseCharge
