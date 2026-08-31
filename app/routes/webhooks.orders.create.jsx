@@ -1129,11 +1129,36 @@ async function setInvoiceCompanyMetafields(admin, ownerIds, fields) {
 async function applyCompanyTaxSettings(admin, locationId, vatNumber, reverseCharge) {
   if (!locationId) return;
 
+  const taxRegistrationId = normalizeVatForCompany(vatNumber);
+  if (!taxRegistrationId) return;
+
+  if (!reverseCharge) {
+    const mutation = `#graphql
+      mutation ApplyInvoiceCompanyTaxRegistration($companyLocationId: ID!, $taxRegistrationId: String!) {
+        companyLocationTaxSettingsUpdate(
+          companyLocationId: $companyLocationId,
+          taxRegistrationId: $taxRegistrationId
+        ) {
+          companyLocation { id }
+          userErrors { field message }
+        }
+      }
+    `;
+
+    const response = await admin.graphql(mutation, {
+      variables: { companyLocationId: locationId, taxRegistrationId },
+    });
+    const data = await response.json();
+    const errors = data?.data?.companyLocationTaxSettingsUpdate?.userErrors || [];
+    if (errors.length) throw new Error(errors.map((error) => error.message).join(" | "));
+    return;
+  }
+
   const mutation = `#graphql
-    mutation ApplyInvoiceCompanyTaxSettings(
+    mutation ApplyInvoiceCompanyReverseChargeTaxSettings(
       $companyLocationId: ID!,
-      $taxRegistrationId: String,
-      $taxExempt: Boolean,
+      $taxRegistrationId: String!,
+      $taxExempt: Boolean!,
       $exemptionsToAssign: [TaxExemption!]
     ) {
       companyLocationTaxSettingsUpdate(
@@ -1151,9 +1176,9 @@ async function applyCompanyTaxSettings(admin, locationId, vatNumber, reverseChar
   const response = await admin.graphql(mutation, {
     variables: {
       companyLocationId: locationId,
-      taxRegistrationId: normalizeVatForCompany(vatNumber) || null,
-      taxExempt: reverseCharge ? true : null,
-      exemptionsToAssign: reverseCharge ? ["EU_REVERSE_CHARGE_EXEMPTION_RULE"] : [],
+      taxRegistrationId,
+      taxExempt: true,
+      exemptionsToAssign: ["EU_REVERSE_CHARGE_EXEMPTION_RULE"],
     },
   });
 
