@@ -818,11 +818,15 @@ async function applyPreCheckoutCompanyTaxSettings(admin, {
     const mutation = `#graphql
       mutation PrepareInvoiceCompanyTaxRegistration(
         $companyLocationId: ID!,
-        $taxRegistrationId: String!
+        $taxRegistrationId: String!,
+        $taxExempt: Boolean!,
+        $exemptionsToRemove: [TaxExemption!]
       ) {
         companyLocationTaxSettingsUpdate(
           companyLocationId: $companyLocationId,
-          taxRegistrationId: $taxRegistrationId
+          taxRegistrationId: $taxRegistrationId,
+          taxExempt: $taxExempt,
+          exemptionsToRemove: $exemptionsToRemove
         ) {
           companyLocation {
             id
@@ -840,10 +844,17 @@ async function applyPreCheckoutCompanyTaxSettings(admin, {
     const data = await graphQL(admin, mutation, {
       companyLocationId: locationId,
       taxRegistrationId,
+      taxExempt: false,
+      exemptionsToRemove: [EU_REVERSE_CHARGE_EXEMPTION],
     });
 
     const errors = data?.data?.companyLocationTaxSettingsUpdate?.userErrors || [];
     if (errors.length) throw new Error(errors.map((error) => error.message).join(" | "));
+
+    console.log("[Invoice Request] Company Location confirmed taxable", {
+      locationId,
+      taxRegistrationId,
+    });
 
     return;
   }
@@ -1317,6 +1328,57 @@ async function ensurePreCheckoutInvoiceCompany(admin, {
   return state;
 }
 
+async function clearCustomerReverseCharge(admin, customerGid) {
+  if (!customerGid) {
+    return {
+      cleared: false,
+      customerTaxExempt: false,
+      customerTaxExemptions: [],
+    };
+  }
+
+  const mutation = `#graphql
+    mutation ClearInvoiceCustomerReverseCharge($input: CustomerInput!) {
+      customerUpdate(input: $input) {
+        customer {
+          id
+          taxExempt
+          taxExemptions
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const data = await graphQL(admin, mutation, {
+    input: {
+      id: customerGid,
+      taxExempt: false,
+      taxExemptions: [],
+    },
+  });
+
+  const errors = data?.data?.customerUpdate?.userErrors || [];
+
+  if (errors.length) {
+    throw new Error(errors.map((error) => error.message).join(" | "));
+  }
+
+  const customer = data?.data?.customerUpdate?.customer || null;
+
+  console.log("[Invoice Request] Customer confirmed taxable", {
+    customerGid,
+    taxExempt: Boolean(customer?.taxExempt),
+    taxExemptions: customer?.taxExemptions || [],
+  });
+
+  return {
+    cleared: true,
+    customerTaxExempt: Boolean(customer?.taxExempt),
+    customerTaxExemptions: customer?.taxExemptions || [],
+  };
+}
+
 async function applyReverseCharge(admin, customerGid) {
   if (!customerGid) {
     return {
@@ -1544,6 +1606,42 @@ export async function action({ request }) {
 
       if (!viesUnavailable && viesValid !== true) {
         const errorMessage = i18n.invalidVat(fullVatNumber);
+
+        if (preparedCustomerGid) {
+          try {
+            await clearCustomerReverseCharge(admin, preparedCustomerGid);
+          } catch (error) {
+            companyPreflight = companyPreflight || emptyCompanyPreflight();
+            companyPreflight.syncRequired = true;
+            companyPreflight.syncReason =
+              companyPreflight.syncReason ||
+              `Pulizia esenzione fiscale cliente da riconciliare: ${error?.message || error}`;
+            companyPreflight.warnings = [
+              ...(companyPreflight.warnings || []),
+              `Customer tax cleanup: ${error?.message || error}`,
+            ];
+          }
+        }
+
+        if (companyPreflight?.companyLocationId) {
+          try {
+            await applyPreCheckoutCompanyTaxSettings(admin, {
+              locationId: companyPreflight.companyLocationId,
+              vatNumber: fullVatNumber,
+              reverseCharge: false,
+            });
+          } catch (error) {
+            companyPreflight.syncRequired = true;
+            companyPreflight.syncReason =
+              companyPreflight.syncReason ||
+              `Pulizia esenzione fiscale sede da riconciliare: ${error?.message || error}`;
+            companyPreflight.warnings = [
+              ...(companyPreflight.warnings || []),
+              `Location tax cleanup: ${error?.message || error}`,
+            ];
+          }
+        }
+
         const invoiceRequest = await createOrUpdateInvoiceRequest({
           shop: session.shop,
           cartToken,
@@ -1608,6 +1706,25 @@ export async function action({ request }) {
         });
       }
 
+      if (reverseCharge && companyPreflight?.companyLocationId) {
+        try {
+          await applyPreCheckoutCompanyTaxSettings(admin, {
+            locationId: companyPreflight.companyLocationId,
+            vatNumber: fullVatNumber,
+            reverseCharge: true,
+          });
+        } catch (error) {
+          companyPreflight.syncRequired = true;
+          companyPreflight.syncReason =
+            companyPreflight.syncReason ||
+            `Reverse charge sede da riconciliare: ${error?.message || error}`;
+          companyPreflight.warnings = [
+            ...(companyPreflight.warnings || []),
+            `Company Location reverse charge: ${error?.message || error}`,
+          ];
+        }
+      }
+
       if (reverseCharge && preparedCustomerGid) {
         try {
           const taxExemptResult = await applyReverseCharge(admin, preparedCustomerGid);
@@ -1643,6 +1760,28 @@ export async function action({ request }) {
         companyPreflight.syncReason =
           companyPreflight.syncReason ||
           "Reverse charge da riconciliare perché il Customer Shopify non è disponibile.";
+      }
+    }
+
+    if (invoiceType === "company" && !reverseCharge && preparedCustomerGid) {
+      try {
+        await clearCustomerReverseCharge(admin, preparedCustomerGid);
+      } catch (error) {
+        companyPreflight = companyPreflight || emptyCompanyPreflight();
+        companyPreflight.syncRequired = true;
+        companyPreflight.syncReason =
+          companyPreflight.syncReason ||
+          `Pulizia esenzione fiscale cliente da riconciliare: ${error?.message || error}`;
+        companyPreflight.warnings = [
+          ...(companyPreflight.warnings || []),
+          `Customer tax cleanup: ${error?.message || error}`,
+        ];
+
+        console.warn("[Invoice Request] stale customer tax exemption cleanup deferred", {
+          customerGid: preparedCustomerGid,
+          countryCode,
+          error: error?.message || String(error),
+        });
       }
     }
 
