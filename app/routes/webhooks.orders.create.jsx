@@ -611,6 +611,84 @@ async function fetchNativeOrderFiscalData(admin, orderGid) {
   };
 }
 
+async function setItalianOrderPec(admin, orderGid, pec) {
+  const normalizedPec = clean(pec).toLowerCase();
+
+  if (!orderGid || !normalizedPec) {
+    return { updated: false, pec: "" };
+  }
+
+  const mutation = `#graphql
+    mutation SetItalianOrderPec($input: OrderInput!) {
+      orderUpdate(input: $input) {
+        order {
+          id
+          localizedFields(first: 20) {
+            nodes {
+              countryCode
+              key
+              purpose
+              title
+              value
+            }
+          }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const response = await admin.graphql(mutation, {
+    variables: {
+      input: {
+        id: orderGid,
+        localizedFields: [
+          {
+            key: "TAX_EMAIL_IT",
+            value: normalizedPec,
+          },
+        ],
+      },
+    },
+  });
+
+  const data = await response.json();
+
+  if (data?.errors?.length) {
+    throw new Error(data.errors.map((error) => error.message).join(" | "));
+  }
+
+  const errors = data?.data?.orderUpdate?.userErrors || [];
+  if (errors.length) {
+    throw new Error(errors.map((error) => error.message).join(" | "));
+  }
+
+  const localizedFields = data?.data?.orderUpdate?.order?.localizedFields?.nodes || [];
+  const savedPecField = localizedFields.find(
+    (field) => clean(field?.key).toUpperCase() === "TAX_EMAIL_IT",
+  );
+
+  const savedPec = clean(savedPecField?.value).toLowerCase();
+
+  if (savedPec !== normalizedPec) {
+    throw new Error(
+      `TAX_EMAIL_IT verification failed: expected ${normalizedPec}, received ${savedPec || "empty"}`,
+    );
+  }
+
+  console.log("[orders/create] Native Italian PEC saved", {
+    orderGid,
+    key: "TAX_EMAIL_IT",
+    countryCode: savedPecField?.countryCode || "IT",
+    pec: "[present]",
+  });
+
+  return {
+    updated: true,
+    pec: savedPec,
+  };
+}
+
 async function setOrderMetafields(admin, orderGid, fields) {
   const metafields = Object.entries(fields)
     .filter(([, value]) => value !== undefined && value !== null && value !== "")
@@ -1134,10 +1212,17 @@ async function applyCompanyTaxSettings(admin, locationId, vatNumber, reverseChar
 
   if (!reverseCharge) {
     const mutation = `#graphql
-      mutation ApplyInvoiceCompanyTaxRegistration($companyLocationId: ID!, $taxRegistrationId: String!) {
+      mutation ApplyInvoiceCompanyTaxRegistration(
+        $companyLocationId: ID!,
+        $taxRegistrationId: String!,
+        $taxExempt: Boolean!,
+        $exemptionsToRemove: [TaxExemption!]
+      ) {
         companyLocationTaxSettingsUpdate(
           companyLocationId: $companyLocationId,
-          taxRegistrationId: $taxRegistrationId
+          taxRegistrationId: $taxRegistrationId,
+          taxExempt: $taxExempt,
+          exemptionsToRemove: $exemptionsToRemove
         ) {
           companyLocation { id }
           userErrors { field message }
@@ -1146,7 +1231,12 @@ async function applyCompanyTaxSettings(admin, locationId, vatNumber, reverseChar
     `;
 
     const response = await admin.graphql(mutation, {
-      variables: { companyLocationId: locationId, taxRegistrationId },
+      variables: {
+        companyLocationId: locationId,
+        taxRegistrationId,
+        taxExempt: false,
+        exemptionsToRemove: ["EU_REVERSE_CHARGE_EXEMPTION_RULE"],
+      },
     });
     const data = await response.json();
     const errors = data?.data?.companyLocationTaxSettingsUpdate?.userErrors || [];
@@ -1418,6 +1508,49 @@ export async function action({ request }) {
           errorMessage: appendSystemNote(administrativeNotes, `System notes:\n${customerCompanySyncNote}`),
         },
       });
+    }
+  }
+
+  // Native Italian PEC for the fiscal connector.
+  // Shopify stores this as the localized field TAX_EMAIL_IT on the Order.
+  // Keep this sync non-blocking so a localized-field edge case never blocks invoice processing.
+  if (pec && clean(finalCountryCode).toUpperCase() === "IT") {
+    try {
+      await setItalianOrderPec(admin, orderGid, pec);
+    } catch (error) {
+      const pecSyncNote = `Native PEC sync failed (TAX_EMAIL_IT): ${error?.message || "Unknown error"}`;
+
+      console.error("[orders/create] Native Italian PEC sync failed", {
+        shop,
+        orderGid,
+        invoiceRequestId,
+        pec: "[present]",
+        error: error?.message || String(error),
+      });
+
+      const where = buildWhere({ shop, invoiceRequestId, cartToken });
+      if (where) {
+        try {
+          await prisma.invoiceRequest.updateMany({
+            where,
+            data: {
+              errorMessage: appendSystemNote(
+                appendSystemNote(
+                  administrativeNotes,
+                  customerCompanySyncNote ? `System notes:\n${customerCompanySyncNote}` : "",
+                ),
+                `System notes:\n${pecSyncNote}`,
+              ),
+            },
+          });
+        } catch (dbError) {
+          console.error("[orders/create] Could not persist PEC sync warning", {
+            shop,
+            orderGid,
+            error: dbError?.message || String(dbError),
+          });
+        }
+      }
     }
   }
 
