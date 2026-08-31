@@ -214,10 +214,12 @@ async function findCustomerByEmail(admin, email) {
 
   const query = `#graphql
     query FindInvoiceCustomerByEmail($query: String!) {
-      customers(first: 1, query: $query) {
+      customers(first: 10, query: $query) {
         nodes {
           id
           email
+          firstName
+          lastName
           taxExempt
           taxExemptions
         }
@@ -226,14 +228,23 @@ async function findCustomerByEmail(admin, email) {
   `;
 
   const data = await graphQL(admin, query, { query: `email:${cleanEmail}` });
-  const customer = data?.data?.customers?.nodes?.[0] || null;
+  const candidates = data?.data?.customers?.nodes || [];
+  const exact = candidates.filter(
+    (customer) => cleanEmailLike(customer?.email) === cleanEmail,
+  );
 
-  console.log("[Invoice Request] customer lookup by email", {
+  if (exact.length > 1) {
+    throw new Error(`Più clienti Shopify hanno la stessa email ${cleanEmail}. Associazione automatica interrotta.`);
+  }
+
+  const customer = exact[0] || null;
+
+  console.log("[Invoice Request] exact customer lookup by email", {
     email: cleanEmail,
     found: Boolean(customer?.id),
     customerId: customer?.id || "",
-    taxExempt: customer?.taxExempt ?? null,
-    taxExemptions: customer?.taxExemptions || [],
+    candidateCount: candidates.length,
+    exactCount: exact.length,
   });
 
   return customer;
@@ -303,86 +314,105 @@ function temporaryCompanyName(vatNumber) {
   return vat ? `invoice-${vat}` : "Invoice company";
 }
 
-async function getPreCheckoutCompanyFromCustomer(admin, customerGid, vatNumber) {
-  if (!customerGid) return null;
 
-  const wantedExternalId = `invoice-${normalizeVatForCompany(vatNumber)}`;
+async function findCompaniesByExactVat(admin, vatNumber) {
+  const wantedVat = normalizeVatForCompany(vatNumber);
+  if (!wantedVat) return [];
+
+  const wantedExternalId = `invoice-${wantedVat}`;
+  const matchesById = new Map();
+  let after = null;
+  let page = 0;
+
   const query = `#graphql
-    query InvoicePreCheckoutCustomerCompanies($id: ID!) {
-      customer(id: $id) {
-        companyContactProfiles {
-            id
-            roleAssignments(first: 50) {
-              nodes {
-                id
-                companyLocation { id }
-                role { id name }
+    query InvoiceCompaniesForExactVat($after: String) {
+      companies(first: 250, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          name
+          externalId
+          defaultRole { id name }
+          contactRoles(first: 20) {
+            nodes { id name }
+          }
+          locations(first: 50) {
+            nodes {
+              id
+              name
+              taxSettings {
+                taxRegistrationId
+                taxExempt
+                taxExemptions
               }
             }
-          company {
-            id
-            name
-            externalId
-            locations(first: 20) { nodes { id name } }
-            defaultRole { id name }
-            contactRoles(first: 20) { nodes { id name } }
           }
         }
       }
     }
   `;
 
-  const data = await graphQL(admin, query, { id: customerGid });
-  const profiles = data?.data?.customer?.companyContactProfiles || [];
+  do {
+    page += 1;
+    const data = await graphQL(admin, query, { after });
+    const connection = data?.data?.companies;
+    const companies = connection?.nodes || [];
 
-  const exactVatProfile = profiles.find(
-    (profile) => clean(profile?.company?.externalId) === wantedExternalId,
-  );
-  if (exactVatProfile?.company?.id) {
-    return { company: exactVatProfile.company, companyContact: exactVatProfile };
-  }
+    for (const company of companies) {
+      const exactLocations = (company?.locations?.nodes || []).filter(
+        (location) =>
+          normalizeVatForCompany(location?.taxSettings?.taxRegistrationId) === wantedVat,
+      );
 
-  // Most invoice customers belong to a single company already. Reuse it instead of
-  // creating a duplicate just because it predates the invoice-* externalId convention.
-  if (profiles.length === 1 && profiles[0]?.company?.id) {
-    return { company: profiles[0].company, companyContact: profiles[0] };
-  }
+      const exactExternalId = clean(company?.externalId) === wantedExternalId;
 
-  return null;
-}
+      if (exactLocations.length || exactExternalId) {
+        const location =
+          exactLocations[0] ||
+          company?.locations?.nodes?.[0] ||
+          null;
 
-async function findPreCheckoutCompanyByVat(admin, vatNumber) {
-  const vat = normalizeVatForCompany(vatNumber);
-  if (!vat) return null;
-
-  const externalId = `invoice-${vat}`;
-  const query = `#graphql
-    query InvoicePreCheckoutCompanyByVat($query: String!) {
-      companies(first: 10, query: $query) {
-        nodes {
-          id
-          name
-          externalId
-          locations(first: 20) { nodes { id name } }
-          defaultRole { id name }
-          contactRoles(first: 20) { nodes { id name } }
-        }
+        matchesById.set(company.id, {
+          company,
+          location,
+          matchedBy: exactLocations.length ? "taxRegistrationId" : "externalId",
+        });
       }
     }
-  `;
 
-  const data = await graphQL(admin, query, { query: `external_id:${externalId}` });
-  return (data?.data?.companies?.nodes || []).find(
-    (company) => clean(company?.externalId) === externalId,
-  ) || null;
+    after = connection?.pageInfo?.hasNextPage
+      ? connection?.pageInfo?.endCursor
+      : null;
+  } while (after && page < 20);
+
+  const matches = [...matchesById.values()];
+
+  console.log("[Invoice Request] exact VAT Company lookup", {
+    vatNumber: wantedVat,
+    matches: matches.map((match) => ({
+      companyId: match.company?.id,
+      companyName: match.company?.name,
+      locationId: match.location?.id,
+      matchedBy: match.matchedBy,
+    })),
+  });
+
+  return matches;
 }
 
-async function createMinimalPreCheckoutCompany(admin, vatNumber) {
+async function createPreCheckoutCompany(admin, {
+  vatNumber,
+  companyName,
+}) {
   const vat = normalizeVatForCompany(vatNumber);
   if (!vat) throw new Error("VAT mancante durante la preparazione Company B2B");
 
-  const name = temporaryCompanyName(vat);
+  const resolvedName = clean(companyName) || temporaryCompanyName(vat);
   const externalId = `invoice-${vat}`;
+
   const mutation = `#graphql
     mutation CreateInvoicePreCheckoutCompany($input: CompanyCreateInput!) {
       companyCreate(input: $input) {
@@ -390,9 +420,21 @@ async function createMinimalPreCheckoutCompany(admin, vatNumber) {
           id
           name
           externalId
-          locations(first: 20) { nodes { id name } }
           defaultRole { id name }
-          contactRoles(first: 20) { nodes { id name } }
+          contactRoles(first: 20) {
+            nodes { id name }
+          }
+          locations(first: 20) {
+            nodes {
+              id
+              name
+              taxSettings {
+                taxRegistrationId
+                taxExempt
+                taxExemptions
+              }
+            }
+          }
         }
         userErrors { field message code }
       }
@@ -401,13 +443,25 @@ async function createMinimalPreCheckoutCompany(admin, vatNumber) {
 
   const data = await graphQL(admin, mutation, {
     input: {
-      company: { name, externalId },
+      company: {
+        name: resolvedName,
+        externalId,
+      },
+      companyLocation: {
+        name: resolvedName,
+      },
     },
   });
-  const errors = data?.data?.companyCreate?.userErrors || [];
-  if (errors.length) throw new Error(errors.map((error) => error.message).join(" | "));
 
-  return data?.data?.companyCreate?.company || null;
+  const errors = data?.data?.companyCreate?.userErrors || [];
+  if (errors.length) {
+    throw new Error(errors.map((error) => error.message).join(" | "));
+  }
+
+  const company = data?.data?.companyCreate?.company || null;
+  if (!company?.id) throw new Error("Creazione Company B2B non riuscita");
+
+  return company;
 }
 
 async function getCompanyContactForCustomer(admin, companyId, customerGid) {
@@ -441,7 +495,9 @@ async function getCompanyContactForCustomer(admin, companyId, customerGid) {
 
 async function assignCustomerToPreCheckoutCompany(admin, companyId, customerGid) {
   const existing = await getCompanyContactForCustomer(admin, companyId, customerGid);
-  if (existing?.id) return existing;
+  if (existing?.id) {
+    return { companyContact: existing, created: false };
+  }
 
   const mutation = `#graphql
     mutation AssignInvoicePreCheckoutCustomer($companyId: ID!, $customerId: ID!) {
@@ -464,13 +520,21 @@ async function assignCustomerToPreCheckoutCompany(admin, companyId, customerGid)
 
   const data = await graphQL(admin, mutation, { companyId, customerId: customerGid });
   const errors = data?.data?.companyAssignCustomerAsContact?.userErrors || [];
+
   if (errors.length) {
     const message = errors.map((error) => error.message).join(" | ");
     if (!/already|contact/i.test(message)) throw new Error(message);
-    return getCompanyContactForCustomer(admin, companyId, customerGid);
+
+    const recovered = await getCompanyContactForCustomer(admin, companyId, customerGid);
+    if (!recovered?.id) throw new Error(message);
+
+    return { companyContact: recovered, created: false };
   }
 
-  return data?.data?.companyAssignCustomerAsContact?.companyContact || null;
+  return {
+    companyContact: data?.data?.companyAssignCustomerAsContact?.companyContact || null,
+    created: true,
+  };
 }
 
 function findOrderingRole(company) {
@@ -479,6 +543,7 @@ function findOrderingRole(company) {
     const name = clean(role?.name).toLowerCase();
     return name === "buyer" || name === "ordering only" || name.includes("ordering");
   });
+
   if (orderingRole?.id) return orderingRole;
 
   const defaultName = clean(company?.defaultRole?.name).toLowerCase();
@@ -502,7 +567,10 @@ async function assignPreCheckoutOrderingRole(admin, company, companyContact, loc
     const roleName = clean(assignment?.role?.name).toLowerCase();
     return roleName === "buyer" || roleName === "ordering only" || roleName.includes("ordering");
   });
-  if (alreadyAssigned) return;
+
+  if (alreadyAssigned) {
+    return { assigned: false };
+  }
 
   const orderingRole = findOrderingRole(company);
   if (!orderingRole?.id) {
@@ -531,43 +599,242 @@ async function assignPreCheckoutOrderingRole(admin, company, companyContact, loc
     companyContactRoleId: orderingRole.id,
     companyLocationId: locationId,
   });
+
   const errors = data?.data?.companyContactAssignRole?.userErrors || [];
   if (errors.length) {
     const message = errors.map((error) => error.message).join(" | ");
     if (!/already|assigned/i.test(message)) throw new Error(message);
+    return { assigned: false };
+  }
+
+  return { assigned: true };
+}
+
+async function applyPreCheckoutCompanyTaxSettings(admin, {
+  locationId,
+  vatNumber,
+  reverseCharge = false,
+}) {
+  if (!locationId) throw new Error("Company Location mancante per i dati fiscali");
+
+  const taxRegistrationId = normalizeVatForCompany(vatNumber);
+  if (!taxRegistrationId) throw new Error("VAT mancante per i dati fiscali Company");
+
+  if (!reverseCharge) {
+    const mutation = `#graphql
+      mutation PrepareInvoiceCompanyTaxRegistration(
+        $companyLocationId: ID!,
+        $taxRegistrationId: String!
+      ) {
+        companyLocationTaxSettingsUpdate(
+          companyLocationId: $companyLocationId,
+          taxRegistrationId: $taxRegistrationId
+        ) {
+          companyLocation {
+            id
+            taxSettings {
+              taxRegistrationId
+              taxExempt
+              taxExemptions
+            }
+          }
+          userErrors { field message }
+        }
+      }
+    `;
+
+    const data = await graphQL(admin, mutation, {
+      companyLocationId: locationId,
+      taxRegistrationId,
+    });
+
+    const errors = data?.data?.companyLocationTaxSettingsUpdate?.userErrors || [];
+    if (errors.length) throw new Error(errors.map((error) => error.message).join(" | "));
+
+    return;
+  }
+
+  const mutation = `#graphql
+    mutation PrepareInvoiceCompanyReverseCharge(
+      $companyLocationId: ID!,
+      $taxRegistrationId: String!,
+      $taxExempt: Boolean!,
+      $exemptionsToAssign: [TaxExemption!]
+    ) {
+      companyLocationTaxSettingsUpdate(
+        companyLocationId: $companyLocationId,
+        taxRegistrationId: $taxRegistrationId,
+        taxExempt: $taxExempt,
+        exemptionsToAssign: $exemptionsToAssign
+      ) {
+        companyLocation {
+          id
+          taxSettings {
+            taxRegistrationId
+            taxExempt
+            taxExemptions
+          }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const data = await graphQL(admin, mutation, {
+    companyLocationId: locationId,
+    taxRegistrationId,
+    taxExempt: true,
+    exemptionsToAssign: [EU_REVERSE_CHARGE_EXEMPTION],
+  });
+
+  const errors = data?.data?.companyLocationTaxSettingsUpdate?.userErrors || [];
+  if (errors.length) throw new Error(errors.map((error) => error.message).join(" | "));
+}
+
+async function setCompanyInvoiceMetafields(admin, {
+  companyId,
+  locationId,
+  vatNumber,
+  pec,
+  sdi,
+  companyName,
+}) {
+  const metafields = [];
+
+  const push = (ownerId, key, value) => {
+    if (!ownerId || !clean(value)) return;
+    metafields.push({
+      ownerId,
+      namespace: "custom",
+      key,
+      type: "single_line_text_field",
+      value: String(value),
+    });
+  };
+
+  push(companyId, "vat_number", normalizeVatForCompany(vatNumber));
+  push(companyId, "pec", cleanEmailLike(pec));
+  push(companyId, "sdi", cleanUpper(sdi));
+  push(companyId, "invoice_company_name", clean(companyName));
+
+  push(locationId, "vat_number", normalizeVatForCompany(vatNumber));
+  push(locationId, "pec", cleanEmailLike(pec));
+  push(locationId, "sdi", cleanUpper(sdi));
+
+  if (!metafields.length) return;
+
+  const mutation = `#graphql
+    mutation SetInvoiceCompanyMetafields($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        userErrors { field message }
+      }
+    }
+  `;
+
+  const data = await graphQL(admin, mutation, { metafields });
+  const errors = data?.data?.metafieldsSet?.userErrors || [];
+  if (errors.length) {
+    console.warn("[Invoice Request] Company fiscal metafields warning", { errors });
   }
 }
 
-async function ensurePreCheckoutInvoiceCompany(admin, customerGid, vatNumber) {
-  if (!customerGid || !vatNumber) return null;
+async function ensurePreCheckoutInvoiceCompany(admin, {
+  customerGid,
+  vatNumber,
+  companyName,
+  pec,
+  sdi,
+}) {
+  if (!customerGid) throw new Error("Cliente Shopify mancante durante il preflight B2B");
+  if (!vatNumber) throw new Error("VAT mancante durante il preflight B2B");
 
-  const linked = await getPreCheckoutCompanyFromCustomer(admin, customerGid, vatNumber);
-  let company = linked?.company || null;
-  let companyContact = linked?.companyContact || null;
+  const exactMatches = await findCompaniesByExactVat(admin, vatNumber);
 
-  if (!company?.id) company = await findPreCheckoutCompanyByVat(admin, vatNumber);
-  if (!company?.id) company = await createMinimalPreCheckoutCompany(admin, vatNumber);
-  if (!company?.id) throw new Error("Creazione Company B2B non riuscita");
-
-  if (!companyContact?.id) {
-    companyContact = await assignCustomerToPreCheckoutCompany(admin, company.id, customerGid);
+  if (exactMatches.length > 1) {
+    throw new Error(
+      `Trovate ${exactMatches.length} aziende Shopify con VAT ${normalizeVatForCompany(vatNumber)}. Nessuna associazione automatica eseguita.`,
+    );
   }
-  if (!companyContact?.id) throw new Error("Associazione Customer → Company non riuscita");
 
-  const locationId = company?.locations?.nodes?.[0]?.id || "";
-  if (!locationId) throw new Error("Company B2B senza sede predefinita");
+  let company;
+  let location;
+  let companyCreated = false;
 
-  await assignPreCheckoutOrderingRole(admin, company, companyContact, locationId);
+  if (exactMatches.length === 1) {
+    company = exactMatches[0].company;
+    location = exactMatches[0].location;
+  } else {
+    company = await createPreCheckoutCompany(admin, {
+      vatNumber,
+      companyName,
+    });
+    companyCreated = true;
+    location = company?.locations?.nodes?.[0] || null;
+  }
 
-  console.log("[Invoice Request] pre-checkout B2B company prepared", {
+  if (!company?.id) throw new Error("Company B2B non disponibile");
+  if (!location?.id) throw new Error("Company B2B senza sede disponibile");
+
+  // Fiscal identity is written before the customer is allowed to buy.
+  // VAT is native Shopify taxRegistrationId; PEC/SDI are persisted as metafields.
+  await applyPreCheckoutCompanyTaxSettings(admin, {
+    locationId: location.id,
+    vatNumber,
+    reverseCharge: false,
+  });
+
+  await setCompanyInvoiceMetafields(admin, {
+    companyId: company.id,
+    locationId: location.id,
+    vatNumber,
+    pec,
+    sdi,
+    companyName,
+  });
+
+  const contactResult = await assignCustomerToPreCheckoutCompany(
+    admin,
+    company.id,
+    customerGid,
+  );
+
+  const companyContact = contactResult?.companyContact;
+  if (!companyContact?.id) {
+    throw new Error("Associazione Customer → Company non riuscita");
+  }
+
+  const roleResult = await assignPreCheckoutOrderingRole(
+    admin,
+    company,
+    companyContact,
+    location.id,
+  );
+
+  const requiresB2BContextRefresh =
+    companyCreated ||
+    Boolean(contactResult?.created) ||
+    Boolean(roleResult?.assigned);
+
+  console.log("[Invoice Request] deterministic B2B preflight complete", {
     customerGid,
     companyId: company.id,
     companyName: company.name,
-    companyLocationId: locationId,
+    companyLocationId: location.id,
     vatNumber: normalizeVatForCompany(vatNumber),
+    companyCreated,
+    contactCreated: Boolean(contactResult?.created),
+    orderingRoleAssigned: Boolean(roleResult?.assigned),
+    requiresB2BContextRefresh,
   });
 
-  return { companyId: company.id, locationId };
+  return {
+    companyId: company.id,
+    companyLocationId: location.id,
+    companyCreated,
+    contactCreated: Boolean(contactResult?.created),
+    orderingRoleAssigned: Boolean(roleResult?.assigned),
+    requiresB2BContextRefresh,
+  };
 }
 
 async function applyReverseCharge(admin, customerGid) {
@@ -718,13 +985,22 @@ export async function action({ request }) {
   let mustUseSameEmailAtCheckout = false;
   let requiresLoginForTaxExemption = false;
   let preparedCustomerGid = customerGid;
+  let companyPreflight = null;
 
   try {
     // BUSINESS PRE-CHECKOUT PREPARATION:
     // Create/find the Shopify Customer and make it an authorized B2B buyer BEFORE
     // Shopify creates the order. This is what lets checkout use the Company purchasing context.
     if (invoiceType === "company") {
-      if (!preparedCustomerGid && customerEmail) {
+      if (!preparedCustomerGid) {
+        if (!customerEmail) {
+          throw new Error(
+            locale === "it"
+              ? "Per la fattura aziendale serve un cliente Shopify identificabile. Accedi oppure inserisci l'email."
+              : "A Shopify customer is required for a company invoice. Sign in or provide the email.",
+          );
+        }
+
         const customerByEmail = await findOrCreateCustomerByEmail(
           admin,
           customerEmail,
@@ -732,19 +1008,23 @@ export async function action({ request }) {
           firstName,
           lastName,
         );
+
         preparedCustomerGid = customerByEmail?.id || "";
+
+        if (!preparedCustomerGid) {
+          throw new Error("Creazione cliente Shopify non riuscita");
+        }
       }
 
-      if (preparedCustomerGid) {
-        await ensurePreCheckoutInvoiceCompany(admin, preparedCustomerGid, fullVatNumber);
-        mustUseSameEmailAtCheckout = Boolean(customerEmail);
-      } else {
-        console.warn("[Invoice Request] B2B pre-checkout preparation skipped: no Customer ID/email", {
-          customerEmail,
-          customerId,
-          vatNumber: fullVatNumber,
-        });
-      }
+      companyPreflight = await ensurePreCheckoutInvoiceCompany(admin, {
+        customerGid: preparedCustomerGid,
+        vatNumber: fullVatNumber,
+        companyName,
+        pec,
+        sdi,
+      });
+
+      mustUseSameEmailAtCheckout = Boolean(customerEmail);
     }
 
     const shouldCheckVies =
@@ -813,6 +1093,13 @@ export async function action({ request }) {
           viesTechnicalError: false,
           customerEmail,
           customerId: preparedCustomerGid || customerGid || customerId || "",
+          companyPrepared: Boolean(companyPreflight?.companyId),
+          companyId: companyPreflight?.companyId || "",
+          companyLocationId: companyPreflight?.companyLocationId || "",
+          companyCreated: Boolean(companyPreflight?.companyCreated),
+          contactCreated: Boolean(companyPreflight?.contactCreated),
+          orderingRoleAssigned: Boolean(companyPreflight?.orderingRoleAssigned),
+          requiresB2BContextRefresh: Boolean(companyPreflight?.requiresB2BContextRefresh),
           message: errorMessage,
         });
       }
@@ -892,6 +1179,13 @@ export async function action({ request }) {
       requiresLoginForTaxExemption,
       customerEmail,
       customerId: preparedCustomerGid || customerGid || customerId || "",
+      companyPrepared: Boolean(companyPreflight?.companyId),
+      companyId: companyPreflight?.companyId || "",
+      companyLocationId: companyPreflight?.companyLocationId || "",
+      companyCreated: Boolean(companyPreflight?.companyCreated),
+      contactCreated: Boolean(companyPreflight?.contactCreated),
+      orderingRoleAssigned: Boolean(companyPreflight?.orderingRoleAssigned),
+      requiresB2BContextRefresh: Boolean(companyPreflight?.requiresB2BContextRefresh),
       message: reverseCharge
         ? viesUnavailable
           ? i18n.viesUnavailable()
